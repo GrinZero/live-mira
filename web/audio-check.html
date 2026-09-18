@@ -1,0 +1,67 @@
+<!doctype html><meta charset="utf-8" /><title>Audio continuity check</title> <button id="run">验证音频</button>
+<pre id="result">等待验证</pre>
+<script type="module">
+  import { seamlessLoop } from './src/audio/loop.ts';
+  import { AudioEngine } from './src/audio/engine.ts';
+  const result = document.querySelector('#result');
+  document.querySelector('#run').onclick = async () => {
+    try {
+      const rows = [];
+      for (const ext of ['ogg', 'm4a'])
+        for (const name of ['rain_loop', 'rain_heavy', 'cafe_bgm']) {
+          result.textContent = '验证 ' + name + '.' + ext;
+          const ctx = new OfflineAudioContext(2, 48000 * 12, 48000);
+          const raw = await ctx.decodeAudioData(await (await fetch('/assets/audio/' + name + '.' + ext)).arrayBuffer());
+          const buf = seamlessLoop(ctx, raw, name === 'cafe_bgm' ? 8 : 4);
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.loop = true;
+          src.connect(ctx.destination);
+          src.start(0, buf.duration - 6);
+          const rendered = await ctx.startRendering();
+          const x = rendered.getChannelData(0);
+          let peak = 0,
+            minRms = 1,
+            maxRms = 0;
+          for (let start = 0; start < x.length; start += 4800) {
+            let sum = 0;
+            for (let i = start; i < Math.min(start + 4800, x.length); i++) {
+              sum += x[i] * x[i];
+              peak = Math.max(peak, Math.abs(x[i]));
+            }
+            const rms = Math.sqrt(sum / 4800);
+            minRms = Math.min(minRms, rms);
+            maxRms = Math.max(maxRms, rms);
+          }
+          const seam = Math.abs(x[6 * 48000] - x[6 * 48000 - 1]);
+          const ok = peak < 1 && minRms > 0.0001 && seam < 0.1;
+          rows.push({ asset: name + '.' + ext, seconds: buf.duration, peak, minRms, maxRms, seam, pass: ok });
+          if (!ok) throw Error(JSON.stringify(rows));
+        }
+      const engine = new AudioEngine();
+      await engine.init();
+      engine.setRainLevel(1);
+      const musicBefore = engine.musicDuck.gain.value;
+      engine.playPcm(new Int16Array(24000).buffer); // silent speech packet still ducks across the utterance
+      await new Promise((r) => setTimeout(r, 700));
+      const ducked = engine.ducked;
+      const during = engine.musicDuck.gain.value;
+      engine.stopPlayback();
+      await new Promise((r) => setTimeout(r, 1800));
+      const recovered = engine.musicDuck.gain.value;
+      engine.setMusicVolume(0);
+      engine.setRainVolume(0);
+      const sources = engine.ambienceSources.length;
+      await engine.dispose();
+      if (!ducked || !(during < musicBefore && recovered > during) || sources !== 3)
+        throw Error('Ducking/layer failure');
+      result.textContent = JSON.stringify(
+        { pass: true, rows, ducking: { musicBefore, during, recovered, sources }, contextClosed: engine.ctx.state },
+        null,
+        2,
+      );
+    } catch (e) {
+      result.textContent = 'FAIL ' + e.stack;
+    }
+  };
+</script>

@@ -1,0 +1,81 @@
+{
+  "_readme": "事件池：inject 以（旁白：…）格式经 conversation.item.create 织入；once 用过即废；when 为触发条件（服务端评估）。tags_hint 是建议指令，模型可覆盖。visual.subject=触发时以当前场景为底图生成变体叠层（i2i），ttl_ms 后自动淡出；临近触发前一轮静默预热缓存。",
+  "events": [
+    {
+      "id": "phone_buzz",
+      "inject": "（旁白：Mira 反扣在桌上的手机震了一下，屏幕亮起又暗下去。她没有去看。）",
+      "when": { "min_turn": 2, "silence_gt": 6 },
+      "tags_hint": { "emotion": "guarded", "action": "none" },
+      "once": true,
+      "note": "最早的悬念钩子：她是有备而来——这条消息是谁发的？"
+    },
+    {
+      "id": "cat_passes",
+      "inject": "（旁白：一只湿淋淋的猫贴着落地玻璃走过，在门口垫子上停了一下又走了。）",
+      "when": { "min_turn": 3 },
+      "tags_hint": { "camera": "pan_door", "emotion": "soft_smile" },
+      "visual": { "subject": "落地玻璃外，一只湿淋淋的黑猫贴着玻璃走过，在门口垫子处停留回望", "ttl_ms": 10000 },
+      "once": true,
+      "note": "松弛节拍，让她露出第一个笑"
+    },
+    {
+      "id": "stranger_falls",
+      "inject": "（旁白：门外一声闷响——一个路人在积水里滑倒了，伞滚出去老远，一时没有爬起来。）",
+      "when": { "min_turn": 4 },
+      "tags_hint": { "camera": "pan_door", "fx": "rain_heavy", "emotion": "surprised" },
+      "enables_scene": "street_outside",
+      "once": true,
+      "note": "主推转场事件：给用户'要不要出去帮忙'的选择支点，可引出医院线"
+    },
+    {
+      "id": "memory_photo",
+      "inject": "（旁白：Mira 从开衫内侧口袋摸出一张折过的照片，指尖在折痕上停了停。）",
+      "when": { "min_turn": 5, "or_user_asks": ["照片", "旅行", "去过", "拍过"] },
+      "tags_hint": { "action": "show_photo", "emotion": "wistful" },
+      "enables_tool": "show_photo",
+      "once": true,
+      "note": "genimg 主钩：照片内容由刚才的对话驱动（对话驱动 prompt）"
+    },
+    {
+      "id": "step_out",
+      "inject": "（旁白：你们推开咖啡馆的门走进雨里。风把雨丝斜斜地送过来，街对面的霓虹在水洼里碎成一片。）",
+      "when": { "min_turn": 4, "or_user_asks": ["出去看看", "出去走走", "出去吧", "去外面", "去街上", "出门"] },
+      "tags_hint": { "camera": "pan_door", "fx": "rain_heavy", "emotion": "surprised" },
+      "enables_scene": "street_outside",
+      "once": true,
+      "note": "用户主动提议出门 → 转场到街上（genimg 场景）"
+    },
+    {
+      "id": "rain_lets_up",
+      "inject": "（旁白：雨势忽然小了一档，屋檐的水声变得稀疏，霓虹在湿漉漉的玻璃上晕开。）",
+      "when": { "min_turn": 6 },
+      "tags_hint": { "fx": "rain_stop", "emotion": "wistful", "camera": "slow_push" },
+      "once": true,
+      "note": "中场转折：今晚的时间开始显得不够"
+    },
+    {
+      "id": "closing_light",
+      "inject": "（旁白：吧台传来关灯声，老板把椅子倒扣上桌。店里只剩你们这盏灯还亮着。）",
+      "when": { "min_turn": 8 },
+      "tags_hint": { "fx": "lights_dim", "camera": "pull_back" },
+      "once": true,
+      "note": "时间压力节拍：打烊逼近，她该决定去留"
+    },
+    {
+      "id": "door_opens",
+      "inject": "（旁白：门被推开，风裹着雨灌进来——进来的人收起伞走向吧台。她的目光在门口停了一瞬，像想起另一个也曾这样推门进来的人。）",
+      "when": { "min_turn": 7, "or_user_asks": ["等谁", "约了谁", "在等", "等人", "等的人", "谁进来", "有人进来"] },
+      "tags_hint": { "emotion": "wistful", "camera": "pan_door" },
+      "once": true,
+      "note": "留白 punchline：门开→她想起他推门的样子→她的表情说话"
+    },
+    {
+      "id": "blackout_flicker",
+      "inject": "（旁白：整条街的灯忽然灭了一秒又亮回来，雨声在黑暗里显得特别近。）",
+      "when": { "min_turn": 9 },
+      "tags_hint": { "fx": "lightning", "emotion": "surprised" },
+      "once": true,
+      "note": "备用张力节拍；也可做降级掩护（'停电了'盖住技术故障）"
+    }
+  ]
+}

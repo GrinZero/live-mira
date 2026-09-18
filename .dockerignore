@@ -1,0 +1,13 @@
+node_modules
+web/node_modules
+web/dist
+dist
+cache
+recordings
+output
+.env
+.git
+.playwright-cli
+*.log
+*.pdf
+explore

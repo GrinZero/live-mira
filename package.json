@@ -1,0 +1,48 @@
+{
+  "name": "rainy-night-mira",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "暴雨夜咖啡馆 · 实时互动场景 — Mira (Whispers from the Star style)",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,magenta \"pnpm run dev:server\" \"pnpm run dev:web\"",
+    "dev:server": "tsx watch server/src/index.ts",
+    "dev:web": "pnpm --filter rainy-night-mira-web run dev",
+    "build": "pnpm --filter rainy-night-mira-web run build",
+    "start": "tsx server/src/index.ts",
+    "setup": "pnpm install && node scripts/fetch-assets.mjs && node scripts/fetch-vision.mjs && node scripts/pregen-bg.mjs && node scripts/synth-audio.mjs",
+    "typecheck": "tsc --noEmit && pnpm --filter rainy-night-mira-web run typecheck",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "pnpm run typecheck && pnpm run lint && pnpm run format:check",
+    "test:e2e": "tsx scripts/test-client.ts",
+    "test": "tsx --test scripts/companion.test.ts scripts/security.test.ts",
+    "test:conversation": "tsx scripts/verify-companion-live.ts"
+  },
+  "dependencies": {
+    "sharp": "^0.35.4",
+    "tsx": "^4.20.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.0",
+    "concurrently": "^9.0.0",
+    "eslint": "^10.10.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.6",
+    "globals": "^17.12.0",
+    "playwright": "^1.63.0",
+    "prettier": "^3.9.6",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.70.0"
+  }
+}

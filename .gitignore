@@ -1,0 +1,12 @@
+node_modules/
+web/dist/
+dist/
+.env
+cache/
+recordings/
+output/
+coverage/
+.playwright-cli/
+*.tsbuildinfo
+*.log
+.DS_Store

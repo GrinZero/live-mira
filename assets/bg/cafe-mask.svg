@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2560" height="1440" viewBox="0 0 2048 1152">
+  <!-- Coordinates follow cafe_interior.jpg. Keep this mask in source-image
+       space: the foreground and background must use identical cover crops. -->
+  <defs>
+    <filter id="edge" x="-1%" y="-1%" width="102%" height="102%">
+      <feGaussianBlur stdDeviation="0.55"/>
+    </filter>
+  </defs>
+  <g fill="white" filter="url(#edge)">
+    <!-- Table: continuous back edge, with no vertical detection-zone seams. -->
+    <path d="M 588 1013 Q 594 1008 610 1006
+      L 1108 944 Q 1126 941 1144 944
+      L 1689 1001 Q 1705 1003 1705 1010
+      L 1703 1051 L 1230 1152 L 1064 1152
+      L 589 1051 Z"/>
+    <!-- Cup and handle, including the opening through the handle. -->
+    <path fill-rule="evenodd" d="M 991 922
+      C 978 919 968 924 970 937 C 971 953 984 968 1000 974
+      C 1003 984 1006 994 1012 1002
+      Q 1048 1010 1080 1003
+      C 1095 986 1101 948 1105 916
+      Q 1108 912 1105 908
+      C 1098 897 1012 895 992 905
+      Q 986 908 991 915 Z
+      M 991 930 C 981 925 975 929 977 938
+      C 980 950 987 958 997 963 Z"/>
+    <!-- Camera body, top controls and strap. -->
+    <path d="M 1185 943 L 1185 925 Q 1186 916 1198 916
+      L 1203 911 L 1214 911 L 1216 909 L 1228 910
+      L 1229 914 L 1243 914 L 1253 902 L 1267 902
+      L 1268 898 L 1287 899 L 1288 903 L 1302 902
+      L 1302 908 L 1295 910 L 1300 921 L 1324 923
+      L 1329 928 L 1340 928 Q 1350 929 1355 945
+      L 1359 982 L 1373 1002 Q 1380 1013 1366 1015
+      L 1346 1010 L 1343 1018 L 1228 1019
+      L 1223 1007 L 1194 1007 Q 1184 1007 1185 995 Z"/>
+  </g>
+</svg>
