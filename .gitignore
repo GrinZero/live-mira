@@ -3,6 +3,7 @@ web/dist/
 dist/
 .env
 cache/
+data/
 recordings/
 output/
 coverage/

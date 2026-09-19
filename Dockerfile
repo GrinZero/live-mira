@@ -24,7 +24,7 @@ COPY content ./content/
 COPY assets ./assets/
 COPY --from=build /app/web/dist ./web/dist
 # cache/（生图落盘）与 recordings/（可选录制）运行期写入
-RUN mkdir -p cache recordings && chown -R node:node /app
+RUN mkdir -p cache recordings data/worlds && chown -R node:node /app
 USER node
 EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

@@ -1,3 +1,4 @@
+import { isStagedScene, sceneFrame, layoutFromUrl } from '../../../shared/scene-layout';
 import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../state/store';
 import { eyeContact } from '../vision/eyeContact';
@@ -22,10 +23,7 @@ export function Background() {
   const url = useStore((s) => s.bgUrl);
   const bgKey = useStore((s) => s.bgKey);
   const cafe = bgKey === 'cafe_interior';
-  const fg = useStore((s) => s.fg);
   const overlay = useStore((s) => s.overlay);
-  // 前景板只对生成时的底图生效；场景变了还没跟上就什么都不画
-  const fgUrl = !cafe && fg && fg.sceneKey === bgKey ? fg.url : null;
   // shown = 正在显示（含淡出中）的叠层；store 清掉或到期时先淡出再卸载
   const [shown, setShown] = useState<{ url: string; out: boolean } | null>(null);
   useEffect(() => {
@@ -59,6 +57,12 @@ export function Background() {
       const ty = gaze ? -gaze.y : pointerY * 0.45;
       x += (tx - x) * 0.055;
       y += (ty - y) * 0.055;
+      if (isStagedScene(useStore.getState().bgUrl)) {
+        if (matteRef.current) matteRef.current.style.transform = 'none';
+        // The ground and actor stay registered; only the extracted near object moves.
+        raf = requestAnimationFrame(tick);
+        return;
+      }
       const matte = matteRef.current;
       const foreground = foregroundRef.current;
       if (matte)
@@ -93,7 +97,10 @@ export function Background() {
   const scale = Math.max(size.width / natural.width, size.height / natural.height);
   const w = natural.width * scale,
     h = natural.height * scale;
-  const style = { width: w, height: h, left: (size.width - w) / 2, top: (size.height - h) / 2 };
+  const frame = sceneFrame(size.width, size.height, layoutFromUrl(url));
+  const style = isStagedScene(url)
+    ? { width: frame.width, height: frame.height, left: frame.left, top: frame.top }
+    : { width: w, height: h, left: (size.width - w) / 2, top: (size.height - h) / 2 };
   const dim = { filter: `brightness(${1 - fx.dim * 0.22})` };
   const ovClass = `overlay-img${shown?.out ? ' out' : ''}`;
   return (
@@ -112,25 +119,12 @@ export function Background() {
         {shown && <img key={`ov-${shown.url}`} style={style} src={shown.url} alt="" className={ovClass} />}
       </div>
       <div className={`scene-depth-haze${cafe ? ' cafe' : ''}`} aria-hidden="true" />
-      {(cafe || fgUrl) && (
-        <div ref={foregroundRef} className={`room-foreground${fgUrl ? ' fg-band' : ''}`} style={dim} aria-hidden="true">
-          {cafe ? (
-            <>
-              <img style={style} src={CAFE_SOURCE} alt="" className="fg-matted" />
-              {shown && <img style={style} src={shown.url} alt="" className={`fg-matted ${ovClass}`} />}
-            </>
-          ) : (
-            <>
-              <img
-                key={fgUrl}
-                style={style}
-                src={fgUrl!}
-                alt=""
-                className={`fg-img${fg?.selfBand ? ' fg-self' : ''}`}
-              />
-              {shown && <img style={style} src={shown.url} alt="" className={`fg-img ${ovClass}`} />}
-            </>
-          )}
+      {/* Only the cafe has a source-aligned object mask. Outdoor JPEG plates
+          contain opaque ground, so compositing them above the actor erases legs. */}
+      {cafe && (
+        <div ref={foregroundRef} className="room-foreground" style={dim} aria-hidden="true">
+          <img style={style} src={CAFE_SOURCE} alt="" className="fg-matted" />
+          {shown && <img style={style} src={shown.url} alt="" className={`fg-matted ${ovClass}`} />}
         </div>
       )}
     </>

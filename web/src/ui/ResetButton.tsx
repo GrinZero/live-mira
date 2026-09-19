@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ClientDirector } from '../state/directorClient';
 
 // "重来"：结束这场相遇，回到雨夜开始——服务端旧会话销毁、新会话就位，
 // 本地画面/字幕/剧情全部归零。两击确认防误触（故事无法回滚）。
-export function ResetButton({ director }: { director: ClientDirector }) {
+export function ResetButton({ onReset }: { onReset: () => Promise<void> }) {
   const [confirm, setConfirm] = useState(false);
   const timer = useRef(0);
 
@@ -18,7 +17,7 @@ export function ResetButton({ director }: { director: ClientDirector }) {
     }
     window.clearTimeout(timer.current);
     setConfirm(false);
-    void director.reset();
+    void onReset();
   };
 
   return (

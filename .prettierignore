@@ -28,3 +28,4 @@ package-lock.json
 *.woff2
 *.jsonl
 .env
+tmp/

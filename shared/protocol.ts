@@ -1,5 +1,6 @@
 // 浏览器 ⇄ 我方服务端 协议（JSON over WebSocket，音频帧用二进制）
 // 下行 = server→client；上行 = client→server
+import type { WorldView } from './world';
 
 export type Emotion = 'neutral' | 'soft_smile' | 'wistful' | 'surprised' | 'warm' | 'guarded';
 export type CameraMove = 'none' | 'idle_drift' | 'slow_push' | 'close_up' | 'pull_back' | 'pan_door';
@@ -70,7 +71,7 @@ export type ClientPhase = 'boot' | 'idle' | 'listening' | 'thinking' | 'speaking
 
 // ---------- 上行 client → server ----------
 export type UpMessage =
-  | { type: 'hello'; session_id?: string; client?: string; client_token?: string } // client_token：会话所有权凭据，reattach 需匹配
+  | { type: 'hello'; session_id?: string; client?: string; client_token?: string; fresh_world?: boolean } // client_token：会话所有权凭据，reattach 需匹配
   | { type: 'debug' } // 订阅服务端日志流（默认不广播；日志含对话内容）
   | { type: 'enter' } // 用户"轻触进入"：开场白
   | { type: 'mic'; muted: boolean }
@@ -78,6 +79,9 @@ export type UpMessage =
   | { type: 'user.activity' } // Local speech/typing cancels a pending continuation
   | { type: 'choice'; id: string }
   | { type: 'scene.presented'; id: string; ok: boolean }
+  | { type: 'travel.request'; locationId: string; intentId: string }
+  | { type: 'travel.cancel'; id: string }
+  | { type: 'map.open'; open: boolean }
   | { type: 'playback'; response_id: string; remaining_ms: number }
   | { type: 'interrupt' } // 本地 VAD 判定的打断
   | { type: 'reset' } // 整场重来：服务端销毁当前会话并在同一连接上重建
@@ -99,6 +103,8 @@ export type DownMessage =
   | { type: 'media.event'; event: MediaEvent }
   | { type: 'interrupted' }
   | { type: 'story'; story: StoryView }
+  | { type: 'world'; world: WorldView }
+  | { type: 'travel.cancelled'; id: string }
   | { type: 'narration'; text: string } // 旁白事件（展示用，可选显示）
   | { type: 'log'; entry: LogEntry }
   | { type: 'error'; code: string; message: string }
@@ -117,7 +123,10 @@ export interface MediaEvent {
   context_id?: string;
   purpose?: 'moment' | 'photo';
   ttl_ms?: number; // overlay 专用：叠入展示时长，到时自动淡出
+  foreground_url?: string; // scene-ready: optional aligned RGBA PNG, prepared with the base
   self_band?: boolean; // foreground 专用：true = 前景层复用底图本身（未通过 i2i 校验的兜底）
+  travel_id?: string; // prepared ACK -> durable world commit -> committed scene
+  committed?: boolean;
 }
 
 export interface LogEntry {

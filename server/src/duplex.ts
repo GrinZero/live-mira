@@ -366,8 +366,26 @@ export class DuplexClient {
     this.stopPacer();
     try {
       if (this.ws?.readyState === WebSocket.OPEN) {
-        this.send({ type: 'session.close' });
-        await new Promise((r) => setTimeout(r, 800));
+        const ws = this.ws;
+        await new Promise<void>((resolve) => {
+          const done = () => {
+            clearTimeout(timer);
+            ws.off('message', onMessage);
+            ws.off('close', done);
+            resolve();
+          };
+          const onMessage = (raw: WebSocket.RawData) => {
+            try {
+              if (JSON.parse(raw.toString()).type === 'session.closed') done();
+            } catch {
+              /* ignore non-JSON frames */
+            }
+          };
+          const timer = setTimeout(done, 800);
+          ws.on('message', onMessage);
+          ws.once('close', done);
+          this.send({ type: 'session.close' });
+        });
       }
       this.ws?.close();
     } catch {

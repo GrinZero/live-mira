@@ -10,7 +10,7 @@ export function InputBar({ director }: { director: ClientDirector }) {
   const invited = useStore((s) => s.story?.phase === 'invitation');
   const submit = () => {
     const t = text.trim();
-    if (!t) return;
+    if (!t || phase === 'reconnecting') return;
     setText('');
     director.sendText(t);
   };
@@ -60,7 +60,7 @@ export function InputBar({ director }: { director: ClientDirector }) {
           打断
         </button>
       ) : (
-        <button className="sendbtn" onClick={submit} disabled={!text.trim()}>
+        <button className="sendbtn" onClick={submit} disabled={!text.trim() || phase === 'reconnecting'}>
           发送
         </button>
       )}

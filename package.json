@@ -22,10 +22,12 @@
     "format:check": "prettier --check .",
     "check": "pnpm run typecheck && pnpm run lint && pnpm run format:check",
     "test:e2e": "tsx scripts/test-client.ts",
-    "test": "tsx --test scripts/companion.test.ts scripts/security.test.ts",
+    "test": "tsx --test scripts/companion.test.ts scripts/security.test.ts scripts/world.test.ts scripts/genimg.test.ts scripts/decisions.test.ts",
+    "test:jev": "tsx scripts/verify-jev-live.ts",
     "test:conversation": "tsx scripts/verify-companion-live.ts"
   },
   "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0",
     "sharp": "^0.35.4",
     "tsx": "^4.20.0",
     "ws": "^8.18.0"

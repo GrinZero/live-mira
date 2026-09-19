@@ -117,24 +117,26 @@ export class Story {
   }
 }
 
-// Require positive action evidence; lack of a question mark is not consent.
+// 门禁只做"否决"，意图判断交给 world 模型（consequence/evidence 锚定原话）。
+// 窄白名单曾把自然说法挡在外面（"带我去你说的那个地方"不命中动词表就被丢成 none）。
+// “……的很好”这类评价/感叹不是意图；疑问、假设、拒绝、将来时同理否决
+const ACTION_VETO =
+  /(如果|假如|假设|以后|改天|吗|么|为何|为什么|怎么|多少|哪[个里儿]|[？?]|不要|不想|不愿|别|不去|[得的](很|真|太|挺|好))/;
 export function isWorldAction(text: string) {
-  if (/(如果|假如|假设|以后|改天|吗|么|为何|为什么|怎么|多少|哪[个里儿]|[？?]|不要|不想|不愿|别|不去)/.test(text))
-    return false;
+  if (ACTION_VETO.test(text)) return false;
   return (
-    /^(好[的啊呀]?|行|可以|嗯|同意)[，。！!\s]*$/.test(text.trim()) ||
-    /(我们|咱们|一起|现在|我|帮你|让它|把).*(去|走|出发|推门|拿|打开|写|放|唱|哼|坐|递|端|捡|接|关|带|喂|摸|拍|看)/.test(
+    /^(好[的啊呀]?|行|可以|嗯|同意|随便|听你的)[，。！!\s]*$/.test(text.trim()) ||
+    /(我们|咱们|一起|现在|我|你|帮我|让它|把|陪|带|想|要|试|看|听|点|写|拿|放|唱|哼|坐|递|端|捡|接|关|开|拍|摸|喂|去|走|来|回|逛)/.test(
       text,
-    ) ||
-    /^(走吧|出发|推门|打开|拿起|放下|坐下|递给|去.{1,20}吧)/.test(text.trim())
+    )
   );
 }
 
 export function isTravelAction(text: string) {
   return (
     isWorldAction(text) &&
-    !/(回忆|想起|记得|上次|以前|去年|小时候|照片里)/.test(text) &&
-    /(出发|出门|出去|走到|前往|离开|去.{1,24}(吧|看看|走走|坐坐)|^(走吧|我们走吧)|回咖啡馆)/.test(text)
+    !/(回忆|想起|记得|上次|去年|小时候|照片里)/.test(text) &&
+    /(去|走|出门|出去|出发|到|回|离开|过来|陪你|带我|看看|走走|逛逛|散个步|溜达|启程|动身)/.test(text)
   );
 }
 

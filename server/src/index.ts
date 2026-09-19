@@ -4,10 +4,11 @@ import path from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { config, hasKeys } from './config.js';
 import { log, tail, subscribe } from './log.js';
-import { ClientSession, getSession, liveSessionCount } from './session.js';
+import { ClientSession, getSession, getOwnedSession, liveSessionCount } from './session.js';
 import { authEnabled, isAuthed, validToken, authCookie, authThrottled, RateLimiter } from './auth.js';
 import { safeJoin, sendFile, sendJson } from './http-static.js';
 import type { UpMessage } from '../../shared/protocol.js';
+import { worldStore } from './world/runtime.js';
 
 // HTTP：静态（web/dist）+ /assets + /media + /api/* ；WS：/ws
 function readBody(req: http.IncomingMessage, limit = 4096): Promise<string> {
@@ -74,6 +75,18 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
   const gated = p.startsWith('/api/') || p.startsWith('/media/') || p.startsWith('/mock/');
   if (gated && !isAuthed(req)) return sendJson(res, 401, { error: 'unauthorized' });
 
+  if (p === '/api/story' && req.method === 'POST') {
+    let token: string;
+    try {
+      token = JSON.parse(await readBody(req)).client_token;
+      if (typeof token !== 'string' || token.length < 16 || token.length > 256) throw new Error('invalid token');
+    } catch {
+      return sendJson(res, 400, { error: 'bad_request' });
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    return sendJson(res, 200, { exists: worldStore().hasStory(token) });
+  }
+
   if (p === '/api/logs') {
     return sendJson(res, 200, tail(Number(url.searchParams.get('n') ?? 300)));
   }
@@ -82,6 +95,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     if (f && fs.existsSync(f) && fs.statSync(f).isFile()) return sendFile(res, f);
   }
   if (p.startsWith('/media/')) {
+    if (p.startsWith('/media/world/')) {
+      const f = worldStore().assetFile(p, url.searchParams.get('access') || '');
+      if (f && fs.existsSync(f)) return sendFile(res, f, true);
+      return sendJson(res, 404, { error: 'not found' });
+    }
     const f = safeJoin(path.join(config.cacheDir, 'media'), p.slice(7));
     if (f && fs.existsSync(f) && fs.statSync(f).isFile()) return sendFile(res, f);
   }
@@ -173,13 +191,14 @@ wss.on('connection', (ws, req) => {
     if (!session) {
       if (msg.type !== 'hello') return;
       // 会话恢复：同进程内同 session_id + 会话令牌匹配 → 复用（浏览器断线重连场景）
-      const prev = msg.session_id ? getSession(msg.session_id) : undefined;
-      if (prev && msg.session_id) {
+      const prev = getOwnedSession(msg.client_token) ?? (msg.session_id ? getSession(msg.session_id) : undefined);
+      if (prev && !msg.fresh_world) {
         if (!prev.owns(msg.client_token)) {
           log('ws', `reattach denied ${msg.session_id} (token mismatch)`);
         } else {
           log('ws', `reattach session ${msg.session_id}`);
           session = prev;
+          connToken = msg.client_token ?? '';
           session.attach(ws);
           return;
         }
@@ -190,14 +209,16 @@ wss.on('connection', (ws, req) => {
         ws.close();
         return;
       }
-      if (liveSessionCount() >= config.maxSessions) {
+      const replacingOwned = msg.fresh_world && prev?.owns(msg.client_token);
+      if (liveSessionCount() - (replacingOwned ? 1 : 0) >= config.maxSessions) {
         ws.send(JSON.stringify({ type: 'error', code: 'busy', message: '今夜客满，换个时间再来吧' }));
         ws.close();
         return;
       }
       session = new ClientSession(tag);
       connToken = msg.client_token ?? '';
-      await session.start(ws, msg);
+      if (msg.fresh_world && prev?.owns(msg.client_token)) await prev.destroy();
+      await session.start(ws, msg, msg.fresh_world === true);
       return;
     }
     if (msg.type === 'reset') {
@@ -209,7 +230,7 @@ wss.on('connection', (ws, req) => {
         const fresh = new ClientSession(tag);
         session = fresh;
         await fresh
-          .start(ws, { client_token: connToken })
+          .start(ws, { client_token: connToken }, true)
           .catch((e) => log('session', `reset start fail: ${(e as Error).message}`));
       })();
       try {

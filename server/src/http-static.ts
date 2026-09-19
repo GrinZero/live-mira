@@ -36,7 +36,7 @@ export function sendJson(res: http.ServerResponse, code: number, obj: unknown) {
   res.end(JSON.stringify(obj));
 }
 
-export function sendFile(res: http.ServerResponse, file: string) {
+export function sendFile(res: http.ServerResponse, file: string, privateAsset = false) {
   const ext = path.extname(file).toLowerCase();
   const stream = fs.createReadStream(file);
   // existsSync → open 之间文件可能消失（TOCTOU）：先挂错误处理，open 成功才写头
@@ -44,7 +44,7 @@ export function sendFile(res: http.ServerResponse, file: string) {
     res.writeHead(200, {
       ...SEC_HEADERS,
       'Content-Type': MIME[ext] ?? 'application/octet-stream',
-      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=300',
+      'Cache-Control': privateAsset ? 'private, no-store' : ext === '.html' ? 'no-cache' : 'public, max-age=300',
     });
     stream.pipe(res);
   });

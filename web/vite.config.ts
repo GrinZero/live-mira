@@ -6,10 +6,10 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/ws': { target: 'ws://localhost:8787', ws: true },
-      '/assets': 'http://localhost:8787',
-      '/media': 'http://localhost:8787',
-      '/api': 'http://localhost:8787',
+      '/ws': { target: process.env.VITE_SERVER_TARGET?.replace(/^http/, 'ws') || 'ws://localhost:8787', ws: true },
+      '/assets': process.env.VITE_SERVER_TARGET || 'http://localhost:8787',
+      '/media': process.env.VITE_SERVER_TARGET || 'http://localhost:8787',
+      '/api': process.env.VITE_SERVER_TARGET || 'http://localhost:8787',
     },
   },
   build: { chunkSizeWarningLimit: 2000 },

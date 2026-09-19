@@ -20,6 +20,14 @@ export class AudioEngine {
   private musicVolume = 0.18;
   private ducked = false;
   private ambienceSources: AudioBufferSourceNode[] = [];
+  private disposed = false;
+  private thunderBuffer?: AudioBuffer;
+  private thunderLoad?: Promise<AudioBuffer | undefined>;
+  private thunderAbort?: AbortController;
+  private thunderSource?: AudioBufferSourceNode;
+  private thunderPending = false;
+  private thunderGeneration = 0;
+  private thunderEvents = new Set<string>();
   private analyserBuf?: Uint8Array;
   private _mouth = 0;
   private _micRms = 0;
@@ -34,7 +42,9 @@ export class AudioEngine {
   micOnFrame?: (pcm: ArrayBuffer, rms: number) => void;
 
   async init() {
+    this.disposed = false;
     this.ctx = new AudioContext({ latencyHint: 'interactive' });
+    const ctx = this.ctx;
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 512;
     this.analyserBuf = new Uint8Array(this.analyser.fftSize);
@@ -58,10 +68,16 @@ export class AudioEngine {
     this.musicGain.connect(this.musicDuck);
     // Resume inside the entry gesture; loading must not consume user activation.
     await this.ctx.resume();
-    await this.loadAmbience();
+    if (this.disposed || this.ctx !== ctx) return;
+    // Optional preload runs alongside ambience, never delaying entry.
+    void this.loadThunder();
+    void this.loadAmbience();
   }
 
   async dispose() {
+    this.disposed = true;
+    this.stopThunder();
+    this.thunderBuffer = undefined;
     this.stopMic();
     this.stopPlayback();
     this.micOnFrame = undefined;
@@ -77,15 +93,33 @@ export class AudioEngine {
     if (this.ctx.state !== 'running') await this.ctx.resume();
   }
 
-  private async pick(urlOgg: string, urlM4a: string): Promise<ArrayBuffer> {
+  private async pick(urlOgg: string, urlM4a: string, signal?: AbortSignal): Promise<ArrayBuffer> {
     const ogg = typeof Audio !== 'undefined' && new Audio().canPlayType('audio/ogg; codecs="opus"');
-    const url = ogg ? urlOgg : urlM4a;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`ambience ${res.status}`);
-    return res.arrayBuffer();
+    const urls = ogg ? [urlOgg, urlM4a] : [urlM4a];
+    let failure: unknown;
+    for (const url of urls) {
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      if (signal?.aborted) throw new Error('audio load cancelled');
+      signal?.addEventListener('abort', abort, { once: true });
+      const timer = setTimeout(abort, 8000);
+      try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) throw new Error(`ambience ${res.status}`);
+        return await res.arrayBuffer();
+      } catch (error) {
+        failure = error;
+        if (signal?.aborted) throw error;
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', abort);
+      }
+    }
+    throw failure;
   }
 
   private async loadAmbience() {
+    const ctx = this.ctx;
     // A missing optional track must never silence the rain.
     await Promise.allSettled([
       ...(
@@ -97,9 +131,11 @@ export class AudioEngine {
       ).map(async ([name, gain, fade, offset]) => {
         try {
           const bytes = await this.pick(`/assets/audio/${name}.ogg?v=2`, `/assets/audio/${name}.m4a?v=2`);
-          const decoded = await this.ctx.decodeAudioData(bytes);
-          const src = this.ctx.createBufferSource();
-          src.buffer = seamlessLoop(this.ctx, decoded, fade);
+          if (this.disposed || this.ctx !== ctx) return;
+          const decoded = await ctx.decodeAudioData(bytes);
+          if (this.disposed || this.ctx !== ctx) return;
+          const src = ctx.createBufferSource();
+          src.buffer = seamlessLoop(ctx, decoded, fade);
           src.loop = true;
           src.connect(gain);
           src.start(0, offset % src.buffer.duration);
@@ -110,6 +146,89 @@ export class AudioEngine {
         }
       }),
     ]);
+  }
+
+  private loadThunder(): Promise<AudioBuffer | undefined> {
+    if (this.disposed || !this.ctx || this.ctx.state === 'closed') return Promise.resolve(undefined);
+    if (this.thunderBuffer) return Promise.resolve(this.thunderBuffer);
+    if (this.thunderLoad) return this.thunderLoad;
+    const ctx = this.ctx;
+    const controller = new AbortController();
+    this.thunderAbort = controller;
+    this.thunderLoad = (async () => {
+      try {
+        const bytes = await this.pick('/assets/audio/thunder.ogg', '/assets/audio/thunder.m4a', controller.signal);
+        if (controller.signal.aborted || this.disposed || this.ctx !== ctx) return;
+        const decoded = await ctx.decodeAudioData(bytes);
+        if (controller.signal.aborted || this.disposed || this.ctx !== ctx || ctx.state === 'closed') return;
+        this.thunderBuffer = decoded;
+        return decoded;
+      } catch (error) {
+        if (!controller.signal.aborted && !this.disposed) console.warn('thunder load fail', error);
+        return undefined;
+      } finally {
+        if (this.thunderAbort === controller) {
+          this.thunderAbort = undefined;
+          this.thunderLoad = undefined;
+        }
+      }
+    })();
+    return this.thunderLoad;
+  }
+
+  /** One real recording per event; drop arrivals while loading, scheduled or playing (no backlog). */
+  playThunder(eventId: string, delaySeconds = 0): void {
+    if (this.disposed || !this.ctx || this.ctx.state === 'closed' || !eventId || this.thunderEvents.has(eventId))
+      return;
+    this.thunderEvents.add(eventId);
+    // Remember even suppressed events, with a bounded FIFO history until reset.
+    if (this.thunderEvents.size > 256) this.thunderEvents.delete(this.thunderEvents.values().next().value!);
+    if (this.thunderPending || this.thunderSource) return;
+    const ctx = this.ctx;
+    const generation = this.thunderGeneration;
+    const start = ctx.currentTime + (Number.isFinite(delaySeconds) ? Math.max(0, delaySeconds) : 0);
+    this.thunderPending = true;
+    void this.loadThunder().then((buffer) => {
+      if (this.disposed || this.ctx !== ctx || generation !== this.thunderGeneration) return;
+      this.thunderPending = false;
+      if (!buffer || ctx.state === 'closed') return;
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      // Rain volume and speech ducking apply here; never feed the mouth analyser.
+      source.connect(this.ambGain);
+      source.onended = () => {
+        source.disconnect();
+        if (this.thunderSource === source) this.thunderSource = undefined;
+      };
+      try {
+        source.start(Math.max(ctx.currentTime, start));
+        this.thunderSource = source;
+      } catch {
+        source.onended = null;
+        source.disconnect();
+      }
+    });
+  }
+
+  /** Reset thunder independently of speech: cancel pending loads, scheduled and active audio, and dedupe. */
+  stopThunder(): void {
+    this.thunderGeneration++;
+    this.thunderAbort?.abort();
+    this.thunderAbort = undefined;
+    this.thunderLoad = undefined;
+    this.thunderPending = false;
+    this.thunderEvents.clear();
+    const source = this.thunderSource;
+    this.thunderSource = undefined;
+    if (source) {
+      source.onended = null;
+      try {
+        source.stop();
+      } catch {
+        // The context may already be closed.
+      }
+      source.disconnect();
+    }
   }
 
   setRainVolume(value: number) {

@@ -18,20 +18,28 @@ export class RealTransport implements Transport {
   onClose?: () => void;
 
   connect(): Promise<void> {
+    this.close();
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    this.ws = new WebSocket(`${proto}://${location.host}/ws`);
-    this.ws.binaryType = 'arraybuffer';
+    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    this.ws = ws;
+    ws.binaryType = 'arraybuffer';
     return new Promise((resolve, reject) => {
-      const to = setTimeout(() => reject(new Error('ws open timeout')), 8000);
-      this.ws!.onopen = () => {
+      let opened = false;
+      const fail = (message: string) => {
         clearTimeout(to);
+        if (this.ws === ws) this.close();
+        reject(new Error(message));
+      };
+      const to = setTimeout(() => fail('ws open timeout'), 8000);
+      ws.onopen = () => {
+        clearTimeout(to);
+        opened = true;
         resolve();
       };
-      this.ws!.onerror = () => {
-        clearTimeout(to);
-        reject(new Error('ws error'));
+      ws.onerror = () => {
+        if (!opened) fail('ws error');
       };
-      this.ws!.onmessage = (ev) => {
+      ws.onmessage = (ev) => {
         if (typeof ev.data === 'string') {
           try {
             this.onMessage(JSON.parse(ev.data) as DownMessage);
@@ -42,7 +50,10 @@ export class RealTransport implements Transport {
           this.onAudio(ev.data as ArrayBuffer);
         }
       };
-      this.ws!.onclose = () => this.onClose?.();
+      ws.onclose = () => {
+        if (!opened) fail('ws closed before opening');
+        else this.onClose?.();
+      };
     });
   }
 
@@ -55,6 +66,9 @@ export class RealTransport implements Transport {
   close() {
     if (this.ws) {
       this.ws.onclose = null;
+      this.ws.onmessage = null;
+      this.ws.onopen = null;
+      this.ws.onerror = null;
       this.ws.close();
     }
   }

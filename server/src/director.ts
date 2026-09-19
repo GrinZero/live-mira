@@ -1,5 +1,6 @@
 import { arkChat } from './ark.js';
 import { log } from './log.js';
+import { pick, type Decide } from './decisions.js';
 import { stripStage } from './duplex.js';
 import { Story, isWorldAction, isTravelAction, sceneDescription, environmentOnly, type WorldUpdate } from './story.js';
 import type { Content } from './content.js';
@@ -29,6 +30,7 @@ export interface DirectorHooks {
   narrateToClient: (text: string) => void;
   story: (view: StoryView) => void;
   available: () => boolean;
+  worldContext?: () => unknown;
 }
 
 export class Director {
@@ -58,6 +60,13 @@ export class Director {
   private mediaSerial = 0;
   private activeMedia = new Set<string>();
   private continuationUsed = true; // No unsolicited follow-up to the opening/event.
+  private decisionAbort = new AbortController();
+  private reactionTask?: Promise<void>;
+  private quietPreference = false;
+  private reaction?: { kind: string; revision: number; expires: number };
+  private reactionBlockedUntil = 0;
+  private lastReactionAt = 0;
+  private sceneIntent = 'unknown';
   private cadence?: {
     revision: number;
     playedAt?: number;
@@ -71,11 +80,28 @@ export class Director {
     private content: Content,
     private hooks: DirectorHooks,
     private chat: typeof arkChat = arkChat,
+    private decide: Decide | null = null,
   ) {
     this.story = new Story();
   }
   get instructions() {
     return this.content.personaInstructions;
+  }
+  restore(key: string, description: string, turns: Turn[]) {
+    this.sceneKey = key;
+    this.sceneDescription = description;
+    this.turns = turns.slice(-80);
+    this.facts = this.turns
+      .filter((t) => t.role === 'user')
+      .map((t) => t.text)
+      .slice(-24);
+    this.miraFacts = this.turns
+      .filter((t) => t.role === 'mira' && !t.interrupted)
+      .map((t) => t.text)
+      .slice(-24);
+    if (turns.length) this.story.phase = 'together';
+    const last = this.turns.at(-1);
+    this.pendingQuestion = last?.role === 'user' ? last.text : '';
   }
   get turnCount() {
     return this.turns.filter((t) => t.role === 'user').length;
@@ -92,6 +118,9 @@ export class Director {
     this.invalidate();
   }
   invalidate() {
+    this.decisionAbort.abort();
+    this.decisionAbort = new AbortController();
+    this.reaction = undefined;
     this.revision++;
     this.cadence = undefined;
   }
@@ -112,6 +141,12 @@ export class Director {
     this.topic = utterance;
     this.pendingQuestion = utterance;
     this.story.hear(text);
+    if (this.decide) {
+      this.quietPreference ||= this.story.quiet;
+      this.story.quiet = this.quietPreference;
+      this.sceneIntent = 'unknown';
+      this.reactionTask = this.classifyReaction(utterance);
+    }
     this.hooks.story(this.story.view());
     // Corrections are kept verbatim and ordered; later statements override earlier ones.
     if (/(我叫|叫我|我的名字|我喜欢|我不喜欢|我住|我在|不是|说错|更正|记住|我今天|我明天)/.test(text)) {
@@ -161,6 +196,75 @@ export class Director {
     this.pendingQuestion = '';
     if (this.cadence && this.cadence.playedAt === undefined) this.cadence.playedAt = Date.now();
   }
+  // Explicit performance owns the body until its hold finishes; Jev only supplies
+  // bounded, nonverbal attention cues when that channel is free.
+  noteStageDirective(d: StageDirective) {
+    if (d.gesture || d.motion) {
+      this.reactionBlockedUntil = Math.max(
+        this.reactionBlockedUntil,
+        Date.now() +
+          Math.max(d.gesture?.hold_ms ?? (d.gesture ? 3500 : 0), d.motion?.duration_ms ?? (d.motion ? 12000 : 0)),
+      );
+    }
+  }
+  private async classifyReaction(utterance: string) {
+    const revision = this.revision;
+    try {
+      const answers = await this.decide!(
+        'reaction',
+        {
+          latest_user: utterance,
+          quiet_preference: this.quietPreference,
+          scene: this.sceneDescription,
+          recent_turns: this.turns.slice(-6),
+        },
+        this.decisionAbort.signal,
+      );
+      if (revision !== this.revision) return;
+      this.sceneIntent = pick(answers, 'intent', 'unknown');
+      const quiet = pick(answers, 'quiet', 'keep', 0.85);
+      if (quiet === 'enter') this.quietPreference = true;
+      if (quiet === 'resume' || (this.sceneIntent === 'question' && answers.intent!.confidence >= 0.9))
+        this.quietPreference = false;
+      // An explicit local quiet request wins over conflicting independent answers.
+      const explicitQuiet = new Story();
+      explicitQuiet.hear(utterance);
+      if (explicitQuiet.quiet) this.quietPreference = true;
+      this.story.quiet = this.quietPreference;
+      const kind = pick(answers, 'reaction', 'none');
+      if (kind !== 'none') this.reaction = { kind, revision, expires: Date.now() + 6000 };
+      this.syncContext();
+      this.advanceReaction();
+    } catch {
+      if (revision === this.revision) log('director', 'jev reaction unavailable; keeping current behavior');
+    }
+  }
+  advanceReaction() {
+    const r = this.reaction;
+    if (!r) return;
+    if (r.revision !== this.revision || Date.now() > r.expires) {
+      this.reaction = undefined;
+      return;
+    }
+    if (
+      !this.hooks.available() ||
+      this.pendingScene ||
+      this.pendingMedia ||
+      this.story.phase === 'farewell' ||
+      Date.now() < this.reactionBlockedUntil ||
+      Date.now() - this.lastReactionAt < 8000
+    )
+      return;
+    this.reaction = undefined;
+    this.lastReactionAt = Date.now();
+    if (r.kind === 'window' && /窗/.test(this.sceneDescription)) {
+      this.hooks.sendDirective({ gesture: { gaze: 'window', hold_ms: 3500 } });
+    } else if (r.kind === 'attentive') {
+      this.hooks.sendDirective({ gesture: { gaze: 'user', hold_ms: 1800 } });
+    } else if (r.kind === 'soften') {
+      this.hooks.sendDirective({ emotion: 'soft_smile' });
+    }
+  }
   // Plan while buffered audio is still playing. Only a browser playback ACK starts the pause.
   async prepareContinuation() {
     const last = this.turns.at(-1);
@@ -186,6 +290,29 @@ export class Director {
     };
     this.cadence = c;
     try {
+      if (this.decide) {
+        await this.reactionTask;
+        if (this.cadence !== c || c.revision !== this.revision || this.story.quiet) return;
+        // A direct question always yields, regardless of a model's confidence.
+        if (/[？?][’”」』"']?\s*$/.test(last.text)) return;
+        const answers = await this.decide(
+          'cadence',
+          {
+            recent_turns: this.turns.slice(-8),
+            just_spoken: last.text,
+            quiet_preference: this.story.quiet,
+            phase: this.story.phase,
+            task: '用户已经被回应，只判断这句实际说完的台词之后是否需要一次自然补充。',
+          },
+          this.decisionAbort.signal,
+        );
+        if (this.cadence !== c || c.revision !== this.revision) return;
+        const mode = pick(answers, 'cadence', 'yield', 0.85);
+        if (mode !== 'continue') {
+          c.mode = mode === 'quiet' ? 'quiet' : 'yield';
+          return;
+        }
+      }
       const raw = await this.chat({
         system: `${this.instructions}\n${CADENCE_PROMPT}`,
         user: JSON.stringify({
@@ -261,6 +388,14 @@ export class Director {
   }
   context() {
     return {
+      visited_world: this.hooks.worldContext?.(),
+      interaction: {
+        intent_hint: this.sceneIntent,
+        quiet_preference: this.story.quiet,
+        guidance: this.story.quiet
+          ? '用户希望安静陪伴；必要时一句简短确认，之后保持安静。'
+          : '正常回应当前用户；意图标签仅作提示，不建立行动事实。',
+      },
       speaker_roles: {
         mira: '你自己，Mira；recent_turns中mira的台词是你说的',
         user: '对面的人；recent_turns中user的台词是他说的',
@@ -380,8 +515,9 @@ export class Director {
     if (d.world.visual_prompt) this.generateMoment(d.world.visual_prompt);
     log('director', `encounter → ${this.story.title}`);
   }
-  async handleTextTurn(userText: string): Promise<void> {
-    const utterance = this.noteUser(userText, true);
+  // noted: 调用方已记过 user 回合（真回合注入路径）时传入合并后的话，避免重复登记
+  async handleTextTurn(userText: string, noted?: string): Promise<void> {
+    const utterance = noted ?? this.noteUser(userText, true);
     const revision = this.revision;
     this.textInFlight++;
     try {
@@ -432,6 +568,9 @@ export class Director {
         /(不一起|不去了|不能去|不方便|你(先|自己|慢)走|我.*(留在|留这|还得))/.test(miraReply))
     )
       return;
+    // A generated destination is only a proposal until the client prepares it and
+    // Session commits arrival. Never turn a provider's past-tense claim into fact.
+    if (world.scene_prompt) world = { ...world, consequence: '正在准备前往新的地点，尚未抵达。' };
     if (world.action === 'resolve' && this.story.resolve(world, userText)) {
       this.hooks.story(this.story.view());
       this.hooks.narrateToClient(this.story.consequence);
@@ -494,6 +633,9 @@ export class Director {
   }
   sceneFailed() {
     this.pendingScene = '';
+    this.story.consequence = '';
+    this.story.title = '';
+    this.hooks.story(this.story.view());
     this.syncContext();
   }
   onMediaSettled(id?: string) {
@@ -524,8 +666,10 @@ export class Director {
   }
   // 工具路径已生成照片：记下时间戳并解除兜底，本回合台词检测不再叠第二张
   notePhotoDispatched() {
+    if (this.pendingMedia || (!this.photoArmed && Date.now() - this.lastPhotoAt < 15000)) return false;
     this.lastPhotoAt = Date.now();
     this.photoArmed = false;
+    return true;
   }
   degradeFor(_kind: 'timeout' | 'bad') {
     this.pendingMedia = false;
@@ -552,7 +696,7 @@ const INDIRECT_HINT = /以前有个|从前有个|那个人|问雨的记忆|旧�
 
 function explicitAction(text: string) {
   return (
-    /(我们|一起|现在|我).*(推门|出门|出去|出发|走到|前往|拿起|打开|写下|放下)/.test(text) &&
+    /(我们|一起|现在|我|带|陪).*(去|走|出门|出去|出发|到|回|推门|拿起|打开|写下|放下|看看|逛逛)/.test(text) &&
     !/(如果|假如|假设|以后|改天|不要|不想|别|吗|？|\?)/.test(text)
   );
 }

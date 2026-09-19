@@ -1,3 +1,4 @@
+import { isStagedScene } from '../../../shared/scene-layout';
 import { useEffect, useMemo, useRef } from 'react';
 import { useFrame, useLoader, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
@@ -7,6 +8,8 @@ import { useStore } from '../state/store';
 import { SCENE_ARRIVE_MS, SCENE_DEPART_MS } from '../state/sceneTransition';
 import { eyeContact, CAM_HFOV, CAM_VFOV } from '../vision/eyeContact';
 import { EMOTION_MAP, EXPRESSION_PRESETS, type CharacterActor } from './actor';
+import { stagingFor } from './staging';
+import { useImageLighting } from './useImageLighting';
 import type { ClientPhase, Emotion, Gesture, GazeTarget, HandAnchor, Motion } from '../../../shared/protocol';
 
 // VrmActor：VRM 角色 + 程序化骨骼动作 + 情绪 expression + 振幅口型 + 眨眼/呼吸/视线
@@ -37,6 +40,7 @@ class VrmActorImpl implements CharacterActor {
   private journey: 'preparing' | 'departing' | 'arriving' | null = null;
   private journeyStart = 0;
   private standing = false;
+  private baseStanding = false; // 场景默认站姿（室外），由 staging 表驱动
   private blinkTimer = 2.5;
   private blinkPhase = 0;
   // 音频驱动动作：能量包络 + 重音脉冲 → 弹簧积分出点头/侧头/歪头
@@ -265,27 +269,36 @@ class VrmActorImpl implements CharacterActor {
     this.journeyStart = performance.now() / 1000;
     // 换景移动拥有全身 locomotion；局部 gesture 仍由上层在换景开始时清理。
     if (journey === 'departing' || journey === 'arriving') this.activeMotion = null;
+    if (!journey) this.standing = this.baseStanding; // 走位结束归位到场景默认姿态
+  }
+
+  setSceneStanding(s: boolean) {
+    this.baseStanding = s;
   }
 
   private motionPose(now: number) {
     const bones = new Map<string, THREE.Euler>();
-    let rootY = this.standing ? 0.16 : 0;
+    let rootY = this.standing || this.baseStanding ? 0.16 : 0;
     let bobY = 0;
     const put = (name: string, x = 0, y = 0, z = 0) => bones.set(name, new THREE.Euler(x, y, z * this.tune.zSign));
 
-    let motion = this.activeMotion;
+    const motion = this.activeMotion;
     let elapsed = motion ? now - this.motionStart : 0;
     let duration = this.motionDur;
-    let journeyK = 1;
+    const journeyK = 1;
     if (!motion && (this.journey === 'departing' || this.journey === 'arriving')) {
-      motion = { action: 'walk', direction: 'left', style: this.journey === 'departing' ? 'brisk' : 'casual' };
+      // Only an anticipatory glance/turn is spatially credible against an
+      // uncalibrated photo. Keep feet and root anchored; the journey is an edit.
       elapsed = now - this.journeyStart;
       duration = (this.journey === 'departing' ? SCENE_DEPART_MS : SCENE_ARRIVE_MS) / 1000;
       const p = THREE.MathUtils.clamp(elapsed / duration, 0, 1);
-      journeyK =
-        this.journey === 'arriving'
-          ? 1 - THREE.MathUtils.smoothstep(p, 0.55, 1)
-          : THREE.MathUtils.smoothstep(p, 0, 0.18);
+      const turn =
+        this.journey === 'departing'
+          ? THREE.MathUtils.smoothstep(p, 0, 0.5)
+          : 1 - THREE.MathUtils.smoothstep(p, 0, 0.7);
+      put('head', 0, -0.24 * turn, 0);
+      put('chest', 0, -0.1 * turn, 0);
+      return { bones, rootY, bobY };
     }
 
     if (!motion) return { bones, rootY, bobY };
@@ -621,6 +634,7 @@ export function VrmActor({ actorRef }: { actorRef: React.MutableRefObject<Charac
   }, [vrm]);
 
   const impl = useMemo(() => new VrmActorImpl(vrm, star, tune, camera), [vrm, star, tune, camera]);
+  useImageLighting(vrm);
 
   useEffect(() => {
     actorRef.current = impl;
@@ -632,16 +646,36 @@ export function VrmActor({ actorRef }: { actorRef: React.MutableRefObject<Charac
     };
   }, [impl, actorRef]);
 
+  // 接触阴影：软圆斑压在脚下，把她"放"在地面上而不是飘在底图上
+  const shadowMat = useRef<THREE.MeshBasicMaterial>(null);
+  const shadowTex = useMemo(() => {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d')!;
+    const grad = g.createRadialGradient(64, 64, 6, 64, 64, 62);
+    grad.addColorStop(0, 'rgba(0,0,0,0.9)');
+    grad.addColorStop(0.55, 'rgba(0,0,0,0.45)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 128, 128);
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }, []);
+
   const placement = useRef<THREE.Group>(null);
+  const shadow = useRef<THREE.Mesh>(null);
   const emotion = useStore((s) => s.emotion);
   const motion = useStore((s) => s.motion);
   const gesture = useStore((s) => s.gesture);
   const phase = useStore((s) => s.phase);
+  const bgKey = useStore((s) => s.bgKey);
   const journey = useStore((s) => s.sceneTransition?.phase);
   useEffect(() => {
     impl.setJourney(journey ?? null);
     if (journey === 'departing' || journey === 'arriving') impl.clearGesture();
   }, [journey, impl]);
+  useEffect(() => impl.setSceneStanding(stagingFor(bgKey).standing), [bgKey, impl]);
   useEffect(() => impl.setEmotion(emotion as Emotion), [emotion, impl]);
   useEffect(() => {
     if (motion) {
@@ -668,26 +702,24 @@ export function VrmActor({ actorRef }: { actorRef: React.MutableRefObject<Charac
     const state = useStore.getState(),
       group = placement.current;
     if (group) {
-      const transition = state.sceneTransition;
-      const moving = transition?.phase === 'departing';
-      const arriving = transition?.phase === 'arriving';
-      const duration = moving ? SCENE_DEPART_MS : arriving ? SCENE_ARRIVE_MS : 1;
-      const progress = transition ? THREE.MathUtils.clamp((Date.now() - transition.startedAt) / duration, 0, 1) : 1;
-      const eased = progress * progress * (3 - 2 * progress);
-      // 离场时真的走出镜头；新底图切入后从同一侧重新进入，避免“原地渐隐换背景”。
-      const travel = moving ? eased : arriving ? 1 - eased : 0;
-      group.rotation.y = -0.48 * travel;
-      group.position.x = -0.86 * travel;
-      group.position.z = -0.34 * travel;
-      const base = state.bgKey === 'cafe_interior' ? -0.26 : -0.18;
-      group.position.y = base + (moving || arriving ? Math.sin(progress * Math.PI * 4) * 0.012 * (1 - progress) : 0);
+      const st = stagingFor(state.bgKey);
+      group.rotation.y = 0;
+      group.position.set(0, st.groundY, 0);
+      if (shadow.current && shadowMat.current) {
+        shadow.current.position.y = isStagedScene(state.bgUrl) ? 0.16 : -0.055 + (st.standing ? 0.16 : 0);
+        shadowMat.current.opacity = st.shadow;
+      }
     }
   });
 
-  // Mira 站位：中轴偏左，面向镜头
+  // Mira 站位：中轴偏左，面向镜头；脚下垫一圈软阴影
   return (
-    <group ref={placement} position={[0, -0.26, 0]}>
+    <group name="mira-placement" ref={placement} position={[0, -0.26, 0]}>
       <primitive object={vrm.scene} position={[-0.02, 0, 0]} rotation={[0, Math.PI * 0.02 + tune.yaw, 0]} />
+      <mesh ref={shadow} position={[-0.02, -0.055, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={-1}>
+        <planeGeometry args={[0.62, 0.4]} />
+        <meshBasicMaterial ref={shadowMat} map={shadowTex} transparent opacity={0.18} depthWrite={false} />
+      </mesh>
     </group>
   );
 }

@@ -1,8 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import WebSocket from 'ws';
+import { randomUUID } from 'node:crypto';
+import { worldStore, drawVisitedRegions } from './world/runtime.js';
+import type { WorldLocation } from '../../shared/world.js';
 import { DuplexClient, parseDirective, showsPhoto, stripStage } from './duplex.js';
 import { Director } from './director.js';
+import { jevDecide } from './decisions.js';
+import { InjectTts } from './inject-tts.js';
 import { createGenImg } from './genimg.js';
 import { loadContent } from './content.js';
 import { config } from './config.js';
@@ -19,11 +24,23 @@ const liveSessions = new Set<ClientSession>();
 export function getSession(id: string) {
   return sessions.get(id);
 }
+export function getOwnedSession(token?: string) {
+  return [...liveSessions].find((s) => s.owns(token));
+}
 export function liveSessionCount() {
   return liveSessions.size;
 }
 
 export class ClientSession {
+  private worldId = '';
+  private mapOpen = false;
+  private restoredWorld = false;
+  private savedMemory = '';
+  private travel?: { id: string; originId: string; target: WorldLocation; event?: MediaEvent; intentId: string };
+  private travelTimer?: NodeJS.Timeout;
+  private travelIntents = new Set<string>();
+  private worldError = false;
+
   private ws?: WebSocket;
   private duplex?: DuplexClient;
   private director: Director;
@@ -59,32 +76,73 @@ export class ClientSession {
   private clientToken = ''; // hello 绑定的会话令牌：reattach 必须持同令牌，sid 本身不是凭据
   private textRate = { n: 0, reset: 0 };
   private lastBufWarn = 0;
+  private injectTts = new InjectTts(); // 打字→话音注入（真回合）；懒连接，复用第二条 duplex WS
+  private injectedUntil = 0; // 注入音频的 ASR 回声抑制窗：窗口内的转写事件不回显、不重复登记
 
   constructor(private clientTag: string) {
-    this.director = new Director(content, {
-      injectNarration: (t) => this.duplex?.injectNarration(t),
-      speak: (line) => this.speakLine(line),
-      sendDirective: (d) => this.send({ type: 'directive', directive: d }),
-      genimg: (kind, theme, opts) => {
-        // overlay = 在当前底图上做 i2i 编辑：基底锚定正在显示的场景，TTL 兜底寿命
-        if (kind === 'overlay' && !opts?.overlay) {
-          opts = { ...opts, overlay: { base: this.director.sceneKey, url: this.currentSceneUrl, ttlMs: 90000 } };
-        }
-        this.genimg.generate(kind, theme, opts);
+    this.director = new Director(
+      content,
+      {
+        injectNarration: (t) => this.duplex?.injectNarration(t),
+        speak: (line) => this.speakLine(line),
+        sendDirective: (d) => this.send({ type: 'directive', directive: d }),
+        genimg: (kind, theme, opts) => {
+          // overlay = 在当前底图上做 i2i 编辑：基底锚定正在显示的场景，TTL 兜底寿命
+          if (kind === 'overlay' && !opts?.overlay) {
+            const u = new URL(this.currentSceneUrl, 'http://local');
+            const file = this.worldId ? worldStore().assetFile(u.pathname, u.searchParams.get('access') || '') : null;
+            opts = {
+              ...opts,
+              overlay: {
+                base: this.director.sceneKey,
+                url: this.currentSceneUrl,
+                file: file || undefined,
+                ttlMs: 90000,
+              },
+            };
+          }
+          if (kind === 'scene' && this.worldId) {
+            this.cancelTravel();
+            this.director.invalidate();
+          }
+          this.genimg.generate(kind, theme, opts);
+        },
+        injectAssistant: (t) => this.duplex?.injectAssistant(t),
+        injectTurnPair: (u, m) => this.duplex?.injectTurnPair(u, m),
+        narrateToClient: (t) => this.send({ type: 'narration', text: t }),
+        story: (story) => this.send({ type: 'story', story }),
+        worldContext: () => {
+          if (!this.worldId) return undefined;
+          const w = worldStore().read(this.worldId);
+          return {
+            current_location_id: w.currentLocationId,
+            locations: w.locations.map((l) => ({
+              id: l.id,
+              name: l.name,
+              description: l.description,
+              environment: l.environment,
+            })),
+            carried_objects: w.objects
+              .filter((o) => o.owner.kind === 'character')
+              .map((o) => ({ id: o.id, kind: o.kind, caption: o.caption })),
+            travelling: !!this.travel,
+          };
+        },
+        available: () =>
+          this.alive &&
+          !this.mapOpen &&
+          !this.travel &&
+          !this.worldError &&
+          !!this.duplex?.connected &&
+          this.entered &&
+          this.ws?.readyState === WebSocket.OPEN &&
+          !this.speaking &&
+          Date.now() > this.playingUntil &&
+          !this.isUserSpeaking(),
       },
-      injectAssistant: (t) => this.duplex?.injectAssistant(t),
-      injectTurnPair: (u, m) => this.duplex?.injectTurnPair(u, m),
-      narrateToClient: (t) => this.send({ type: 'narration', text: t }),
-      story: (story) => this.send({ type: 'story', story }),
-      available: () =>
-        this.alive &&
-        !!this.duplex?.connected &&
-        this.entered &&
-        this.ws?.readyState === WebSocket.OPEN &&
-        !this.speaking &&
-        Date.now() > this.playingUntil &&
-        !this.isUserSpeaking(),
-    });
+      undefined,
+      config.jevEnabled ? jevDecide : null,
+    );
     liveSessions.add(this);
     this.genimg = createGenImg({
       styleTemplate: content.styleTemplate,
@@ -93,8 +151,34 @@ export class ClientSession {
         if (!this.alive) return;
         const request = e.context_id ?? e.id;
         if (e.kind === 'scene') {
-          if (e.status === 'generating') this.latestSceneRequest = request;
-          else if (this.latestSceneRequest && this.latestSceneRequest !== request) {
+          if (e.status === 'generating') {
+            this.cancelTravel();
+            this.latestSceneRequest = request;
+            if (this.worldId) {
+              const w = worldStore().read(this.worldId);
+              this.travel = {
+                id: e.id,
+                originId: w.currentLocationId,
+                intentId: request,
+                target: {
+                  id: randomUUID(),
+                  key: e.scene_key || e.id,
+                  name: this.locationName(e.subject || '新的地方'),
+                  description: e.subject || '新的地方',
+                  url: '',
+                  firstVisitedAt: 0,
+                  lastVisitedAt: 0,
+                  visits: 0,
+                  x: 0,
+                  y: 0,
+                  mapStatus: 'pending',
+                  environment: { rain: 1, dim: 0 },
+                },
+              };
+              this.armTravelTimeout();
+              this.publishWorld();
+            }
+          } else if (this.latestSceneRequest && this.latestSceneRequest !== request) {
             this.director.onMediaSettled(e.context_id);
             return;
           } else this.latestSceneRequest = request;
@@ -108,16 +192,196 @@ export class ClientSession {
         }
         if (e.status !== 'generating') this.director.onMediaSettled(e.context_id);
         if (e.kind === 'scene' && e.status === 'ready' && e.scene_key && e.url) {
-          this.stagedScene = e; // Commit the location only once the browser can display it.
+          if (this.worldId && this.travel?.id === e.id) {
+            try {
+              const url = worldStore().promote(this.worldId, e.url);
+              e = { ...e, url, travel_id: this.travel.id };
+              this.travel.target = {
+                ...this.travel.target,
+                key: e.scene_key!,
+                url,
+                description: e.subject || this.travel.target.description,
+                fgUrl: undefined,
+              };
+              this.travel.event = e;
+              this.publishWorld();
+            } catch {
+              this.failWorld('场景还没有保存好，我们留在原处。');
+              this.cancelTravel();
+              return;
+            }
+          }
+          this.stagedScene = e; // Browser preparation precedes durable arrival.
         }
         if (e.kind === 'foreground' && e.status === 'ready' && e.url && e.scene_key === this.director.sceneKey) {
           this.currentFgUrl = e.url;
+          if (this.worldId) {
+            try {
+              const url = worldStore().promote(this.worldId, e.url);
+              e = { ...e, url };
+              this.currentFgUrl = url;
+              worldStore().update(this.worldId, e.id, 'foreground', (w) => {
+                const l = w.locations.find((l) => l.id === w.currentLocationId)!;
+                l.fgUrl = url;
+              });
+            } catch {
+              /* Optional foreground leaves the durable base intact. */
+            }
+          }
         }
-        if (e.kind === 'scene' && e.status === 'failed') this.director.sceneFailed();
+        if (e.kind === 'photo' && e.status === 'ready' && e.url && this.worldId) {
+          try {
+            const url = worldStore().promote(this.worldId, e.url);
+            e = { ...e, url };
+            worldStore().update(this.worldId, e.id, 'photo', (w) => {
+              w.objects.push({
+                id: e.id,
+                kind: 'photo',
+                url,
+                caption: e.caption,
+                owner: { kind: 'character', hand: 'left' },
+              });
+            });
+          } catch {
+            this.send({ type: 'error', code: 'photo_save', message: '照片暂时无法保存，请稍后再试。' });
+            return;
+          }
+        }
+        if (e.kind === 'scene' && e.status === 'failed') {
+          this.director.sceneFailed();
+          this.cancelTravel();
+        }
         this.send({ type: 'media.event', event: e });
       },
       onDegrade: (reason) => this.director.degradeFor(reason),
     });
+  }
+
+  private handleTravelWords(text: string): boolean {
+    if (!this.worldId) return false;
+    if (this.travel && /^(算了|不去了|先不去|别走了|取消|不用去了)[吧了。！!\s]*$/.test(text.trim())) {
+      this.cancelTravel();
+      this.handleInterrupt('client');
+      this.send({ type: 'state', phase: 'listening' });
+      return true;
+    }
+    if (!/(回到|回去|返回|回刚才|再去|回.*咖啡)/.test(text) || /[?？]|要不要|能不能|想不想|不要|别回/.test(text))
+      return false;
+    const w = worldStore().read(this.worldId);
+    const matches = w.locations.filter(
+      (l) => text.includes(l.name) || (l.key === 'cafe_interior' && /咖啡馆/.test(text)),
+    );
+    if (matches.length !== 1) return false;
+    this.returnTo(matches[0].id, randomUUID());
+    return true;
+  }
+  private locationName(description: string) {
+    const destination = description.match(/目的地（([^）]+)）/)?.[1];
+    return (destination || description.split(/[。！\n]/)[0]).slice(0, 24);
+  }
+  private failWorld(message: string) {
+    this.worldError = true;
+    this.send({ type: 'error', code: 'world_storage', message });
+  }
+  private publishWorld() {
+    if (!this.worldId) return;
+    const world = worldStore().view(this.worldId);
+    if (this.travel)
+      world.travel = {
+        id: this.travel.id,
+        targetId: this.travel.target.id,
+        status: this.travel.event ? 'ready' : 'preparing',
+      };
+    this.send({ type: 'world', world });
+  }
+  private checkpointWorld() {
+    if (!this.worldId || !this.entered) return;
+    const memory = JSON.stringify(this.director.turns);
+    if (memory === this.savedMemory) return;
+    try {
+      worldStore().update(this.worldId, randomUUID(), 'memory', (w) => {
+        w.memory = this.director.turns.slice(-80);
+      });
+      this.savedMemory = memory;
+      this.worldError = false;
+    } catch {
+      if (!this.worldError) this.failWorld('对话暂时无法保存，请检查连接后重试。');
+    }
+  }
+  private sendForeground(url: string, key: string) {
+    this.send({
+      type: 'media.event',
+      event: { id: 'restore-fg', kind: 'foreground', status: 'ready', scene_key: key, url },
+    });
+  }
+  private restoreScene() {
+    this.publishWorld();
+    this.send({
+      type: 'media.event',
+      event: {
+        id: 'restore',
+        kind: 'scene',
+        status: 'ready',
+        scene_key: this.director.sceneKey,
+        url: this.currentSceneUrl,
+      },
+    });
+    if (this.currentFgUrl) this.sendForeground(this.currentFgUrl, this.director.sceneKey);
+  }
+  private armTravelTimeout() {
+    if (this.travelTimer) clearTimeout(this.travelTimer);
+    this.travelTimer = setTimeout(() => {
+      this.cancelTravel();
+      this.send({ type: 'error', code: 'travel_timeout', message: '新地点还没准备好，我们留在原处。' });
+    }, 120000);
+  }
+  private cancelTravel() {
+    if (!this.travel) return;
+    const id = this.travel.id;
+    this.latestSceneRequest = `cancelled:${id}`;
+    this.director.onMediaSettled(this.travel.event?.context_id || this.travel.intentId);
+    this.travel = undefined;
+    this.stagedScene = undefined;
+    if (this.travelTimer) clearTimeout(this.travelTimer);
+    this.director.sceneFailed();
+    this.send({ type: 'travel.cancelled', id });
+    this.publishWorld();
+  }
+  private returnTo(locationId: string, intentId: string) {
+    if (!this.worldId || !this.entered || this.worldError || this.travelIntents.has(intentId)) return;
+    const w = worldStore().read(this.worldId);
+    const target = w.locations.find((l) => l.id === locationId);
+    if (!target || target.id === w.currentLocationId) {
+      this.send({
+        type: 'error',
+        code: 'travel_unavailable',
+        message: target ? '我们已经在这里。' : '这个地方还没有去过。',
+      });
+      return;
+    }
+    this.travelIntents.add(intentId);
+    if (this.travelIntents.size > 100) this.travelIntents.delete(this.travelIntents.values().next().value!);
+    this.handleInterrupt('client');
+    this.director.noteUserActivity();
+    this.cancelTravel();
+    const id = randomUUID();
+    const event: MediaEvent = {
+      id,
+      kind: 'scene',
+      status: 'ready',
+      url: target.url,
+      scene_key: target.key,
+      subject: target.description,
+      travel_id: id,
+    };
+    this.travel = { id, originId: w.currentLocationId, target, intentId, event };
+    this.stagedScene = event;
+    this.latestSceneRequest = id;
+    this.armTravelTimeout();
+    this.publishWorld();
+    this.send({ type: 'state', phase: 'listening' });
+    this.send({ type: 'media.event', event: { ...event, status: 'generating' } });
+    this.send({ type: 'media.event', event });
   }
 
   // ---------- 生命周期 ----------
@@ -127,9 +391,22 @@ export class ClientSession {
     return this.clientToken !== '' && this.clientToken === token;
   }
 
-  async start(ws: WebSocket, hello?: { session_id?: string; client_token?: string }) {
+  async start(ws: WebSocket, hello?: { session_id?: string; client_token?: string }, freshWorld = false) {
     this.ws = ws;
-    this.clientToken = hello?.client_token ?? '';
+    this.clientToken = hello?.client_token || randomUUID();
+    try {
+      const w = worldStore().open(this.clientToken, freshWorld);
+      this.worldId = w.id;
+      this.restoredWorld = w.entered;
+      const l = w.locations.find((l) => l.id === w.currentLocationId)!;
+      this.currentSceneUrl = l.url;
+      this.currentFgUrl = l.fgUrl;
+      this.director.restore(l.key, l.description, w.memory);
+      this.savedMemory = JSON.stringify(this.director.turns);
+    } catch {
+      this.failWorld('无法打开相遇存档，请重试。');
+      throw new Error('world storage unavailable');
+    }
     // Only sessions found in the local map are resumed. An unknown upstream id
     // would restore the actor without its world/memory, creating split context.
     const resumeSid = undefined;
@@ -144,8 +421,11 @@ export class ClientSession {
     } catch (e) {
       log('session', `duplex connect fail: ${(e as Error).message}`);
       this.send({ type: 'error', code: 'duplex_connect', message: '语音服务连接失败，请重试' });
+      await this.destroy();
       return;
     }
+    this.restoreScene();
+    this.director.syncContext();
     this.tickTimer = setInterval(() => this.tick(), 250);
   }
 
@@ -193,6 +473,34 @@ export class ClientSession {
         // 开场：轻触进入 → 开麦 + 开场白（导演递词）+ 初始 directive
         if (this.entered) break;
         this.entered = true;
+        if (this.worldId) {
+          try {
+            const w = worldStore().read(this.worldId);
+            if (!w.entered) {
+              const url = worldStore().promote(w.id, this.currentSceneUrl);
+              const mapUrl = w.locations[0].mapUrl ? worldStore().promote(w.id, w.locations[0].mapUrl) : undefined;
+              worldStore().update(w.id, 'enter', 'enter', (w) => {
+                w.entered = true;
+                w.locations[0].url = url;
+                if (mapUrl) w.locations[0].mapUrl = mapUrl;
+              });
+              this.currentSceneUrl = url;
+            }
+            this.publishWorld();
+            drawVisitedRegions(this.worldId, () => {
+              if (this.alive) this.publishWorld();
+            });
+          } catch {
+            this.entered = false;
+            this.failWorld('这次相遇暂时无法保存，请重试。');
+            break;
+          }
+        }
+        if (this.restoredWorld) {
+          this.director.syncContext();
+          this.send({ type: 'state', phase: 'listening' });
+          break;
+        }
         this.send({ type: 'story', story: this.director.story.view() });
         const line = content.openingLines[Math.floor(Math.random() * content.openingLines.length)];
         this.send({ type: 'directive', directive: { emotion: 'guarded', camera: 'idle_drift', fx: 'rain_heavy' } });
@@ -217,27 +525,58 @@ export class ClientSession {
         }
         break;
       }
+      case 'map.open':
+        this.mapOpen = msg.open === true;
+        this.director.noteUserActivity();
+        if (this.mapOpen) {
+          this.publishWorld();
+          if (this.worldId)
+            drawVisitedRegions(
+              this.worldId,
+              () => {
+                if (this.alive) this.publishWorld();
+              },
+              true,
+            );
+        }
+        break;
+      case 'travel.request':
+        if (typeof msg.locationId === 'string' && typeof msg.intentId === 'string' && msg.intentId.length <= 100)
+          this.returnTo(msg.locationId, msg.intentId);
+        break;
+      case 'travel.cancel':
+        if (msg.id === this.travel?.id) this.cancelTravel();
+        break;
       case 'scene.presented': {
         const scene = this.stagedScene;
         if (!scene || scene.id !== msg.id) break;
-        this.stagedScene = undefined;
-        if (msg.ok && scene.url && scene.scene_key) {
-          this.currentSceneUrl = scene.url;
-          this.currentFgUrl = undefined;
-          this.director.sceneReady(scene.scene_key, scene.subject ?? scene.scene_key);
-          // 前景板：地点落定后补一层 i2i 近景（锚定刚上屏的这张底图，生成期间前景淡出浮现）
-          if (scene.scene_key !== 'cafe_interior') {
-            const file = scene.url.startsWith('/media/')
-              ? path.join(config.cacheDir, 'media', path.basename(scene.url))
-              : scene.url.startsWith('/assets/bg/')
-                ? path.join(config.assetsDir, 'bg', path.basename(scene.url))
-                : undefined;
-            this.genimg.generate('foreground', scene.subject ?? scene.scene_key, {
-              sceneKey: scene.scene_key,
-              overlay: { base: scene.scene_key, file: file && fs.existsSync(file) ? file : undefined, url: scene.url },
+        if (!msg.ok) {
+          this.cancelTravel();
+          this.director.sceneFailed();
+          break;
+        }
+        if (this.travel && scene.travel_id === this.travel.id) {
+          const travel = this.travel;
+          try {
+            worldStore().arrive(this.worldId, travel.id, travel.originId, travel.target);
+            this.stagedScene = undefined;
+            this.travel = undefined;
+            if (this.travelTimer) clearTimeout(this.travelTimer);
+            this.currentSceneUrl = travel.target.url;
+            this.currentFgUrl = travel.target.fgUrl;
+            this.director.sceneReady(travel.target.key, travel.target.description);
+            this.publishWorld();
+            this.send({ type: 'media.event', event: { ...scene, committed: true } });
+            if (travel.target.fgUrl) this.sendForeground(travel.target.fgUrl, travel.target.key);
+            // The base is durable. Never pay to regenerate on return.
+            drawVisitedRegions(this.worldId, () => {
+              if (this.alive) this.publishWorld();
             });
+          } catch {
+            this.failWorld('到达状态未能保存，我们还在原处。');
+            this.cancelTravel();
           }
-        } else this.director.sceneFailed();
+        }
         break;
       }
       case 'playback': {
@@ -248,14 +587,14 @@ export class ClientSession {
         break;
       }
       case 'text': {
-        // 每条文字回合都是付费 LLM 调用：按会话限速防刷（choice 经内部 text 也计数）
+        // 每条文字回合都是付费调用：按会话限速防刷（choice 经内部 text 也计数）
         if (this.textThrottled()) {
           this.send({ type: 'error', code: 'rate_limited', message: '慢一点，我还在消化刚才的话。' });
           break;
         }
         this.handleInterrupt('client');
         this.send({ type: 'state', phase: 'thinking' });
-        await this.director.handleTextTurn(msg.text); // 注入音频→真回合；之后状态由下行音频事件驱动
+        await this.handleTypedTurn(msg.text);
         break;
       }
       case 'interrupt':
@@ -372,6 +711,7 @@ export class ClientSession {
 
   // ---------- 下行：Duplex 事件 ----------
   private onDuplexEvent(evt: Record<string, unknown>) {
+    if (!this.alive) return;
     const t = String(evt.type ?? '');
     this.rec(t, evt.type === 'response.output_audio.delta' ? { n: String(evt.delta ?? '').length } : evt);
 
@@ -380,20 +720,23 @@ export class ClientSession {
       const sid = String(sess?.id ?? evt.session_id ?? '');
       if (sid) {
         sessions.set(sid, this);
-        this.send({ type: 'session', session_id: sid, resumed: false });
+        this.send({ type: 'session', session_id: sid, resumed: this.restoredWorld });
+        this.restoreScene();
       }
       return;
     }
 
-    // 用户语音转写流（服务端 VAD 产出）
+    // 用户语音转写流（服务端 VAD 产出）。注入的打字话音也会被 ASR 转写——
+    // 那是回声：客户端已回显原文、context 已按原文登记，这里不回显不重复记。
     if (t.includes('transcription')) {
       const text = String(evt.text ?? evt.transcript ?? evt.delta ?? '');
+      const echo = Date.now() < this.injectedUntil;
       this.director.noteUserActivity(); // 真实用户语音活动：重置静默钟，压住进行中的 cue/poke 注入
       if (t.endsWith('started')) {
-        this.pendingVoiceUser = '';
+        if (!echo) this.pendingVoiceUser = ''; // 回声窗内保留打字原文给 handleVoiceWorld
         this.userSpeaking = true;
         this.userSpeakingAt = Date.now();
-        if (text.trim()) {
+        if (text.trim() && !echo) {
           this.send({ type: 'transcript.user', text, final: false });
           this.sentUserPartial = true;
         }
@@ -402,18 +745,33 @@ export class ClientSession {
         else this.send({ type: 'state', phase: 'listening' });
       } else if (t.endsWith('completed') || t.endsWith('done')) {
         this.userSpeaking = false;
+        if (echo) {
+          this.injectedUntil = 0;
+          this.sentUserPartial = false;
+          this.discardPending('user turn');
+          if (text.trim()) {
+            this.send({ type: 'state', phase: 'thinking' });
+            this.tSpeechEnd = Date.now();
+            this.seenFirstAudio = false;
+          }
+          return;
+        }
         if (text.trim() || this.sentUserPartial) this.send({ type: 'transcript.user', text, final: true });
         this.sentUserPartial = false;
         if (text.trim()) {
           this.discardPending('user turn'); // 用户新一轮输入取代暂扣中的可疑响应
           this.pendingVoiceUser = this.director.noteUser(text);
+          if (this.handleTravelWords(text)) {
+            this.pendingVoiceUser = '';
+            return;
+          }
           this.send({ type: 'state', phase: 'thinking' });
           this.tSpeechEnd = Date.now();
           this.seenFirstAudio = false;
         }
       } else {
         this.userSpeakingAt = Date.now(); // 转写增量也算说话活动，续命自愈窗
-        if (text.trim()) {
+        if (text.trim() && !echo) {
           this.send({ type: 'transcript.user', text, final: false });
           this.sentUserPartial = true;
         }
@@ -554,7 +912,10 @@ export class ClientSession {
       } else if (name === 'show_photo') {
         const subject = String(args.subject ?? '一张旅途中的照片');
         const caption = String(args.caption ?? '');
-        this.director.notePhotoDispatched(); // 演员自发调用 → 解除兜底并记时，防台词检测再叠一张
+        if (!this.director.notePhotoDispatched()) {
+          results.push({ call_id: callId, result: { ok: true, status: 'photo_already_dispatched' } });
+          continue;
+        }
         this.director.pendingMedia = true;
         this.genimg.generate('photo', subject, { caption });
         results.push({ call_id: callId, result: { ok: true } });
@@ -568,6 +929,7 @@ export class ClientSession {
 
   // ---------- 导演 tick：静默驱动 ----------
   private tick() {
+    this.checkpointWorld();
     if (!this.alive || !this.duplex?.connected) return;
     const s = this.director.quietSec();
     if (
@@ -580,6 +942,7 @@ export class ClientSession {
     )
       return;
     this.director.advanceConversation();
+    this.director.advanceReaction();
     // Long silences still belong to the environment director.
     if (s > 10) void this.director.evaluate('tick').then((d) => this.director.apply(d));
   }
@@ -628,6 +991,26 @@ export class ClientSession {
     }
   }
 
+  // 文字回合走真回合：把用户打字 TTS 成话音喂进她的耳朵，她自己组织回答——
+  // 和开口说话同一条心智，不再是 ark 代笔念稿。TTS/链路失败退回代笔兜底。
+  private async handleTypedTurn(text: string) {
+    const utterance = this.director.noteUser(text, true);
+    if (this.handleTravelWords(text)) return;
+    try {
+      if (!this.duplex?.connected) throw new Error('duplex not connected');
+      const pcm = await this.injectTts.synthesize(utterance);
+      if (!this.alive || !this.duplex?.connected) return;
+      // pendingVoiceUser 记原文（不记 ASR 回声）：handleTextDone → handleVoiceWorld 走与语音相同的世界更新
+      this.pendingVoiceUser = utterance;
+      this.injectedUntil = Date.now() + Math.round((pcm.length / 640) * 20) + 6000;
+      this.duplex.injectAudio(pcm);
+      log('session', `typed turn injected as voice (${Math.round((pcm.length / 640) * 20)}ms)`);
+    } catch (e) {
+      log('session', `tts inject failed, ghost-writer fallback: ${(e as Error).message}`);
+      await this.director.handleTextTurn(text, utterance);
+    }
+  }
+
   // ---------- 注入通道：提示/打字 → TTS → 演员耳朵（触发真回合，她自己组织台词） ----------
   private speakLine(line: string) {
     this.duplex?.speak(line);
@@ -643,8 +1026,24 @@ export class ClientSession {
   // ---------- 发送 ----------
   send(msg: DownMessage) {
     if (!this.alive) return;
+    if (msg.type === 'directive') this.director.noteStageDirective(msg.directive);
     // 录制客户端可见事件流（mock 回放用）——与 audio.pcm 字节流同时间轴
     this.rec(msg.type, msg);
+    if (msg.type === 'directive' && msg.directive.fx && this.worldId && this.entered) {
+      const fx = msg.directive.fx;
+      if (['rain_stop', 'rain_heavy', 'lights_dim'].includes(fx)) {
+        try {
+          worldStore().update(this.worldId, randomUUID(), 'environment', (w) => {
+            const l = w.locations.find((l) => l.id === w.currentLocationId)!;
+            if (fx === 'rain_stop') l.environment.rain = 0;
+            if (fx === 'rain_heavy') l.environment.rain = 1.6;
+            if (fx === 'lights_dim') l.environment.dim = 1;
+          });
+        } catch {
+          this.failWorld('环境状态未能保存，请稍后重试。');
+        }
+      }
+    }
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
   }
   private sendBinary(buf: Buffer) {
@@ -666,7 +1065,10 @@ export class ClientSession {
     // 接管即踢前主：同一时刻只允许一个控制端；旧 ws 的 close 由 detach(ws) 的身份校验挡掉
     const prev = this.ws;
     this.ws = ws;
+    this.cancelTravel();
+    this.mapOpen = false;
     if (prev && prev !== ws && prev.readyState === WebSocket.OPEN) prev.close(4000, 'session moved');
+    this.publishWorld();
     this.send({ type: 'story', story: this.director.story.view() });
     if (this.graceTimer) {
       clearTimeout(this.graceTimer);
@@ -704,6 +1106,8 @@ export class ClientSession {
   detach(ws: WebSocket) {
     // 只有当前控制端的 close 才启动宽限销毁；被踢旧连接的迟到 close 不得误杀会话
     if (this.ws !== ws) return;
+    this.cancelTravel();
+    this.mapOpen = false;
     this.ws = undefined;
     this.director.invalidate();
     // 宽限 8s 供重连续接；超时销毁
@@ -718,6 +1122,10 @@ export class ClientSession {
   }
 
   async destroy() {
+    if (!this.alive) return;
+    if (this.graceTimer) clearTimeout(this.graceTimer);
+    this.checkpointWorld();
+    if (this.travelTimer) clearTimeout(this.travelTimer);
     this.alive = false;
     liveSessions.delete(this);
     if (this.tickTimer) clearInterval(this.tickTimer);
@@ -725,6 +1133,7 @@ export class ClientSession {
     this.recAudio?.end();
     this.director.invalidate();
     await this.duplex?.close();
+    await this.injectTts.close();
     // 摘除所有历史 sid（重连可能换过上游会话）：陈旧 sid 不允许再 attach 进尸体
     for (const [sid, s] of sessions) if (s === this) sessions.delete(sid);
   }

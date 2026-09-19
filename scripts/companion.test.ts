@@ -755,6 +755,26 @@ test('voice world uses the actual reply; a refusal cannot turn into a joint depa
   assert.equal(media.length, 0);
 });
 
+test('proposed travel cannot narrate arrival before the scene commits', async () => {
+  const text = '我们现在一起出发去桥边吧。';
+  const { d, narrations, media } = harness(async () =>
+    JSON.stringify({
+      action: 'resolve',
+      evidence: text,
+      consequence: '两人已经抵达桥边。',
+      scene_prompt: '雨夜桥边',
+    }),
+  );
+  d.noteUser(text);
+  await d.handleVoiceWorld(text, '好，我们走吧。');
+  assert.equal(media.length, 1);
+  assert.deepEqual(narrations, ['正在准备前往新的地点，尚未抵达。']);
+  assert.doesNotMatch(JSON.stringify(d.story.context()), /已经抵达/);
+  d.sceneFailed();
+  assert.equal(d.story.consequence, '');
+  assert.equal(d.story.title, '');
+});
+
 test('background prompt removes actors and no-change placeholders', async () => {
   const { environmentOnly } = await import('../server/src/story.js');
   assert.equal(environmentOnly('无'), undefined);
@@ -976,7 +996,7 @@ test('reset returns the whole stage to the entrance and asks the server for a fr
   const client = new ClientDirector(false);
   const sent: UpMessage[] = [];
   const c = client as unknown as { engine: unknown; transport: unknown };
-  c.engine = { stopPlayback: () => {}, setRainLevel: () => {} };
+  c.engine = { stopPlayback: () => {}, stopThunder: () => {}, setRainLevel: () => {} };
   c.transport = { send: (m: UpMessage) => sent.push(m) };
   useStore.setState({
     phase: 'speaking',
@@ -1006,10 +1026,10 @@ test('reset returns the whole stage to the entrance and asks the server for a fr
     gesture: { hand_r: 'table' },
     toast: 'x',
   });
-  await client.reset();
+  const resetting = client.reset();
   const s = useStore.getState();
   assert.equal(s.entered, false);
-  assert.equal(s.phase, 'idle');
+  assert.equal(s.phase, 'boot');
   assert.equal(s.story, null);
   assert.equal(s.bgKey, 'cafe_interior');
   assert.equal(s.bgUrl, '/assets/bg/cafe_interior.jpg');
@@ -1026,12 +1046,14 @@ test('reset returns the whole stage to the entrance and asks the server for a fr
   assert.equal(s.emotion, 'neutral');
   assert.equal(s.motion, null);
   assert.deepEqual(sent, [{ type: 'reset' }]);
+  (client as any).onMessage({ type: 'session', session_id: 'new-sid', resumed: false });
+  await resetting;
 });
 
 test('a reset-era media event cannot repaint the wiped scene', async () => {
   const client = new ClientDirector(false);
   const c = client as unknown as { engine: unknown; transport: unknown; onMessage(m: DownMessage): void };
-  c.engine = { stopPlayback: () => {}, setRainLevel: () => {} };
+  c.engine = { stopPlayback: () => {}, stopThunder: () => {}, setRainLevel: () => {} };
   c.transport = { send: () => {} };
   const original = (globalThis as any).Image;
   (globalThis as any).Image = class {
@@ -1043,7 +1065,7 @@ test('a reset-era media event cannot repaint the wiped scene', async () => {
   try {
     useStore.setState({ phase: 'listening', entered: true, bgKey: 'street', bgUrl: 'street.jpg', generating: [] });
     c.onMessage({ type: 'media.event', event: { id: 'old-scene', kind: 'scene', status: 'generating' } });
-    await client.reset();
+    const resetting = client.reset();
     // 换会话窗口：新 session 就位前，旧会话的迟到下行一律丢弃
     c.onMessage({ type: 'media.event', event: { id: 'old-scene', kind: 'scene', status: 'ready', url: 'late.jpg' } });
     c.onMessage({
@@ -1059,6 +1081,7 @@ test('a reset-era media event cannot repaint the wiped scene', async () => {
     assert.equal(useStore.getState().subtitles.length, 0);
     // 新 session 就位后，新会话的事件正常落地
     c.onMessage({ type: 'session', session_id: 'new-sid', resumed: false });
+    await resetting;
     useStore.setState({ phase: 'listening', entered: true });
     c.onMessage({ type: 'media.event', event: { id: 'new-scene', kind: 'scene', status: 'generating' } });
     c.onMessage({ type: 'media.event', event: { id: 'new-scene', kind: 'scene', status: 'ready', url: 'fresh.jpg' } });
@@ -1112,4 +1135,102 @@ test('local speech during a listening pause notifies the server before transcrip
   useStore.setState({ micMuted: true });
   for (let i = 0; i < 10; i++) c.onMicFrame(new ArrayBuffer(640), 0.04);
   assert.equal(sent.length, 2);
+});
+
+test('photo tool does not duplicate a typed request or a previous tool dispatch', () => {
+  const typed = harness();
+  typed.d.noteUser('给我看看你拍的极光照片。', true);
+  assert.equal(typed.media.length, 1);
+  assert.equal(typed.d.notePhotoDispatched(), false);
+  const tool = harness();
+  assert.equal(tool.d.notePhotoDispatched(), true);
+  assert.equal(tool.d.notePhotoDispatched(), false);
+});
+
+test('missing media terminal event expires and late success cannot reopen the photo', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const client = new ClientDirector(false);
+  const c = client as unknown as { onMessage(m: DownMessage): void };
+  useStore.setState({ generating: [], photo: null, toast: '' });
+  c.onMessage({ type: 'media.event', event: { id: 'lost', kind: 'photo', status: 'generating' } });
+  t.mock.timers.tick(300000);
+  assert.equal(useStore.getState().generating.length, 0);
+  assert.match(useStore.getState().toast, /暂时/);
+  c.onMessage({ type: 'media.event', event: { id: 'lost', kind: 'photo', status: 'ready', url: 'late.jpg' } });
+  assert.equal(useStore.getState().photo, null);
+});
+
+test('reconnect is single-flight and exhausted attempts remain manually retryable', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const client = new ClientDirector(false);
+  const c = client as unknown as {
+    engine: unknown;
+    start(): Promise<void>;
+    reconnectTimer?: ReturnType<typeof setTimeout>;
+  };
+  c.engine = { dispose: async () => {} };
+  let attempts = 0;
+  let fail!: (error: Error) => void;
+  c.start = () => {
+    attempts++;
+    return new Promise<void>((_resolve, reject) => {
+      fail = reject;
+    });
+  };
+  for (let i = 0; i < 3; i++) {
+    const attempt = client.reconnect();
+    await Promise.resolve();
+    await client.reconnect();
+    assert.equal(attempts, i + 1);
+    fail(new Error('offline'));
+    await attempt;
+  }
+  assert.equal(useStore.getState().phase, 'reconnecting');
+  assert.match(useStore.getState().toast, /点屏幕重试/);
+  t.mock.timers.tick(60000);
+  assert.equal(attempts, 3);
+});
+
+test('disconnected input does not create a thinking turn or send a lost message', () => {
+  const client = new ClientDirector(false);
+  const sent: UpMessage[] = [];
+  (client as unknown as { transport: unknown }).transport = { send: (m: UpMessage) => sent.push(m) };
+  useStore.setState({ phase: 'reconnecting', subtitles: [] });
+  client.sendText('still typing');
+  client.choose('choice');
+  assert.deepEqual(sent, []);
+  assert.deepEqual(useStore.getState().subtitles, []);
+  assert.equal(useStore.getState().phase, 'reconnecting');
+});
+
+test('an error toast during reconnect cannot unlock disconnected input', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const client = new ClientDirector(false);
+  const c = client as unknown as { engine: unknown; onMessage(m: DownMessage): void };
+  c.engine = { playbackRemainingMs: () => 0 };
+  useStore.setState({ phase: 'reconnecting' });
+  c.onMessage({ type: 'error', code: 'duplex_close_1006', message: '正在恢复连接' });
+  assert.equal(useStore.getState().phase, 'reconnecting');
+});
+
+test('reset waits for the replacement session and rejects connection failure', async (t) => {
+  const initial = useStore.getState();
+  t.after(() => useStore.setState(initial, true));
+  const client = new ClientDirector(false) as any;
+  client.engine = { stopPlayback() {}, stopThunder() {}, setRainLevel() {}, async dispose() {} };
+  client.transport = { send() {}, close() {} };
+  client.started = true;
+  let ready = false;
+  const reset = client.reset().then(() => {
+    ready = true;
+  });
+  await Promise.resolve();
+  assert.equal(ready, false, 'reset must not complete before session acknowledgement');
+  client.onMessage({ type: 'session', session_id: 'replacement', resumed: false });
+  await reset;
+  assert.equal(ready, true);
+  const failed = client.reset();
+  client.onMessage({ type: 'error', code: 'duplex_connect', message: 'connection failed' });
+  await assert.rejects(failed, /connection failed/);
+  assert.equal(client.started, false, 'failure must permit another start');
 });

@@ -63,7 +63,7 @@ export async function arkImage(opts: {
         prompt: opts.prompt,
         size: opts.size || config.genimgSize,
         response_format: 'url',
-        watermark: true,
+        watermark: false,
         ...(opts.image ? { image: opts.image } : {}),
       }),
       signal: ctl.signal,

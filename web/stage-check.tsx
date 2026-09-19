@@ -18,6 +18,7 @@ harness.transport = {
 };
 (window as any).__media = (e: any) => harness.onMessage({ type: 'media.event', event: e });
 useStore.setState({ phase: 'listening', entered: true });
+const foreground = new URLSearchParams(location.search).get('foreground') || undefined;
 const scene = new URLSearchParams(location.search).get('scene') || '/assets/bg/cafe_interior.jpg';
 function Check() {
   const transition = useStore((s) => s.sceneTransition);
@@ -42,7 +43,14 @@ function Check() {
               () =>
                 harness.onMessage({
                   type: 'media.event',
-                  event: { id: 'check', kind: 'scene', status: 'ready', url: scene, scene_key: 'outside' },
+                  event: {
+                    id: 'check',
+                    kind: 'scene',
+                    status: 'ready',
+                    url: scene,
+                    scene_key: 'outside',
+                    foreground_url: foreground,
+                  },
                 }),
               1500,
             );

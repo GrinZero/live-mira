@@ -1,3 +1,11 @@
+import { sceneGuide, GUIDE_INSTRUCTION } from './scene-guide.js';
+import {
+  sceneLayoutPrompt,
+  randomSceneLayout,
+  layoutToken,
+  layoutFromUrl,
+  type SceneLayout,
+} from '../../shared/scene-layout.js';
 import { sceneDescription } from './story.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -10,6 +18,7 @@ import type { MediaEvent } from '../../shared/protocol.js';
 
 // 生图管线：主题 → 风格模板 → Seedream → 下载 → 质检 → 重试 → 缓存 → 降级
 export interface GenImgDeps {
+  layoutRandom?: () => number;
   styleTemplate: string;
   sceneBodies: Record<string, string>;
   sendMedia: (e: MediaEvent) => void;
@@ -17,6 +26,7 @@ export interface GenImgDeps {
 }
 
 const inflight = new Map<string, Promise<void>>();
+const sceneLayouts = new Map<string, SceneLayout>();
 
 // theme 可能是 LLM 写的中文长句 → 文件名安全 key
 function safeKey(theme: string): string {
@@ -38,6 +48,7 @@ async function qualityCheck(buf: Buffer, kind?: MediaEvent['kind']): Promise<{ o
       return { ok: false, reason: `bad_dims:${meta.width}x${meta.height}` };
     }
     if (kind === 'scene' && meta.width && meta.height) {
+      if (Math.abs(meta.width / meta.height - 16 / 9) > 0.03) return { ok: false, reason: 'scene_aspect_mismatch' };
       const stripe = Math.floor(meta.width / 4);
       for (const left of [0, meta.width - stripe]) {
         const edge = await sharp(buf).extract({ left, top: 0, width: stripe, height: meta.height }).stats();
@@ -85,6 +96,7 @@ const FG_DRIFT_MAX = 32;
 // overlay = 当前场景的生成式变体叠层：以基底场景图为参考做图编辑（保构图只加元素），
 // 无参考图时退化为"场景体+主题"文生图。silent=true 只做缓存预热，不下发媒体事件。
 export interface GenImgOpts {
+  layout?: SceneLayout;
   caption?: string;
   contextId?: string;
   purpose?: 'moment' | 'photo';
@@ -104,20 +116,20 @@ export function buildMediaPrompt(
   const body = bodies[theme] ?? theme;
   if (kind === 'photo') {
     return (
-      `直接呈现以下摄影主体的完整画面：${body}。主题中的地点和物件是最高优先级。` +
+      `照片内容：${body}。以真实摄影表现主题本身，自然材质、可信光照和镜头景深。` +
       (opts.purpose === 'moment'
-        ? '这是眼前环境或物件的特写。'
-        : '这是照片里的内容本身，不是有人在观看照片的场面；不要相框、纸边、手指、相机或额外的咖啡馆。') +
-      '自然光影，细腻胶片质感。不要擅自改成雨夜霓虹街景。无UI。'
+        ? '这是眼前物件或环境的特写，主体清晰。'
+        : '独立照片构图，不包含相框、纸边、手指或观看照片的人。') +
+      '忠实遵守主题的时间、天气和地点，不套用场景站位、咖啡馆布景或固定雨夜色调。除非主题明确要求，不添加人物。无文字无UI。'
     );
   }
-  if (kind === 'scene') {
-    return (
-      `空无一人的环境建立镜头，绝对不要任何人物、人体局部、人影、人物剪影。${buildPrompt(style, bodies, theme)}` +
-      '手机竖屏9:16环境构图。人眼高度约1.5米的平视镜头，保持镜头水平；地平线在画面高度的40%附近。禁止贴地、仰拍或倾斜镜头。右侧中上部清楚展示地点特征，左侧中部留给前景角色。近处地面不超过下方三分之一，禁止巨大近景物件。完整连续的环境铺满整个画幅。左右边缘都是同一个真实场景的延续，有自然的地面、天空和环境细节。无人物，无白色留空，无拼贴，无分屏，无边框。不要标题、字母、数字、摄影参数、海报排版或文字水印。'
-    );
+  if (kind === 'foreground') {
+    return `以前景参考底图为唯一依据，保持构图、视角、材质、光照和色调完全不变。只在最下缘添加符合该地点的少量失焦近景物件：${body}。不要重画中远景，不遮挡预留站位及接地点，不添加人物，无文字无UI。`;
   }
-  return buildPrompt(style, bodies, theme);
+  if (kind === 'overlay') {
+    return `编辑当前底图，只添加事件：${body}。保留参考图原有风格、镜头、空间布局、地面和人物站位，不转换成插画，不重新设计场景。新元素遵循原图材质和光照。无额外文字无UI。`;
+  }
+  return buildPrompt(style, bodies, theme) + sceneLayoutPrompt(opts.layout);
 }
 
 const newId = () => `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
@@ -136,48 +148,27 @@ export function createGenImg(deps: GenImgDeps) {
   }
 
   function overlayPrompt(base: string, theme: string, refImage?: string): string {
-    if (refImage) {
-      return (
-        `保持参考图的构图、光影、色调、视角完全不变，只在画面中合理地添加：${theme}。` +
-        '新元素要与雨夜环境自然融合（湿润反光、胶片颗粒、浅景深），无文字无 UI。'
-      );
-    }
-    const body = sceneBodies[base] ?? base;
-    return buildPrompt(styleTemplate, sceneBodies, `${body}，${theme}`);
-  }
-
-  // foreground = 同场景的近景前景板：i2i 保构图，只在画面下缘加失焦前景元素；
-  // 客户端只取底部羽化带，轻微错位被浅景深掩盖。无参考图时退化文生图（仍只用作前景带）。
-  function foregroundPrompt(theme: string, refImage?: string): string {
-    const place = theme.slice(0, 100);
-    if (refImage) {
-      return (
-        `保持参考图的构图、光影、色调、视角完全不变，只在画面最下缘的近景处添加与该场景自然融合的失焦前景元素，` +
-        `例如桌沿、吧台、栏杆、窗框边、被雨打湿的植物叶影——只占画面底部约四分之一，明显虚化。场景：${place}。不要人物，无文字，无UI。`
-      );
-    }
     return (
-      `电影感空镜，画面下缘是失焦模糊的近景前景（桌沿、栏杆或植物叶影），中远景是环境：${place}。` +
-      '浅景深，雨夜电影色调一致。不要人物，无文字，无UI。'
+      buildMediaPrompt('overlay', styleTemplate, sceneBodies, theme, {}) +
+      (refImage ? '' : `环境：${sceneBodies[base] ?? base}。`)
     );
   }
 
-  async function attempt(prompt: string, image?: string, portrait = false): Promise<Buffer> {
-    const { url } = await arkImage({ prompt, image, ...(portrait ? { size: '1440x2560' } : {}) });
+  function foregroundPrompt(theme: string, _refImage?: string): string {
+    return buildMediaPrompt('foreground', styleTemplate, sceneBodies, theme, {});
+  }
+
+  async function attempt(prompt: string, image?: string, portrait = false, scene = false): Promise<Buffer> {
+    const { url } = await arkImage({
+      prompt,
+      image,
+      ...(scene ? { size: '2560x1440' } : portrait ? { size: '1440x2560' } : {}),
+    });
     return download(url);
   }
 
-  async function run(kind: MediaEvent['kind'], theme: string, opts: GenImgOpts) {
+  async function run(kind: MediaEvent['kind'], theme: string, opts: GenImgOpts, key: string) {
     const sceneKey = opts.sceneKey ?? (kind === 'scene' ? safeKey(theme) : kind);
-    const key = `${kind}_${sceneKey}_${crypto
-      .createHash('md5')
-      .update(
-        'composition-mobile-v4' +
-          buildMediaPrompt(kind, styleTemplate, sceneBodies, theme, opts) +
-          (opts.caption ?? ''),
-      )
-      .digest('hex')
-      .slice(0, 10)}`;
     const id = newId();
     const file = path.join(dir, `${key}.jpg`);
     const url = `/media/${key}.jpg`;
@@ -219,6 +210,10 @@ export function createGenImg(deps: GenImgDeps) {
     let refImage: string | undefined;
     let refBuf: Buffer | undefined;
     let prompt = buildMediaPrompt(kind, styleTemplate, sceneBodies, theme, opts);
+    if (kind === 'scene') {
+      refImage = `data:image/png;base64,${(await sceneGuide(opts.layout)).toString('base64')}`;
+      prompt = GUIDE_INSTRUCTION + prompt;
+    }
     if (opts.overlay) {
       const baseFile = opts.overlay.file ?? baseImageFile(opts.overlay.base);
       if (baseFile) {
@@ -249,7 +244,18 @@ export function createGenImg(deps: GenImgDeps) {
     let tryN = 0;
     while (tryN < 2) {
       try {
-        const raw = await attempt(prompt, refImage, portrait);
+        let raw = await attempt(prompt, refImage, portrait, kind === 'scene');
+        if (kind === 'scene') {
+          fs.writeFileSync(path.join(dir, `${key}.layout.png`), await sharp(raw).png().toBuffer());
+          // The layout pass may retain guide marks. Clean them in a separate edit
+          // before caching or publishing; never expose the layout draft.
+          raw = await attempt(
+            '精确清理这张环境图：移除所有紫红色矩形框、青色或蓝绿色椭圆标记、构图网格和辅助线，用周围相同的地面或背景无缝补全。保持所有建筑、镜头、透视、画幅、地面位置、材质和光照不变。不要添加人物或人体局部，不要重新构图。只输出清理后的同一张环境图。',
+            `data:image/jpeg;base64,${(await toJpeg(raw)).toString('base64')}`,
+            false,
+            true,
+          );
+        }
         const qc = await qualityCheck(raw, kind);
         if (!qc.ok) {
           log('genimg', `qc fail ${key} ${qc.reason} (try ${tryN})`);
@@ -262,7 +268,9 @@ export function createGenImg(deps: GenImgDeps) {
           if (kind !== 'overlay') onDegrade('bad', kind);
           return;
         }
-        const jpg = await toJpeg(raw);
+        const jpg = await toJpeg(
+          kind === 'scene' ? await sharp(raw).resize(2560, 1440, { fit: 'cover' }).toBuffer() : raw,
+        );
         // 前景板的硬约束：与底图做结构漂移校验，不配合宁可退化也不错位上屏
         if (kind === 'foreground' && refBuf) {
           const drift = await plateDrift(refBuf, jpg);
@@ -286,7 +294,7 @@ export function createGenImg(deps: GenImgDeps) {
           return;
         }
         // 图编辑失败（参数不支持/图过大等）→ 退化文生图重试，不占重试次数
-        if (refImage) {
+        if (refImage && kind !== 'scene') {
           refImage = undefined;
           prompt = overlayPrompt(opts.overlay!.base, theme);
           continue;
@@ -303,7 +311,7 @@ export function createGenImg(deps: GenImgDeps) {
   }
 
   return {
-    // 同 key 并发生图去重；命中在途任务（多为静默预热）时，非静默调用落定后补发结果
+    // 新照片和事件叠层独立生图；场景和前景缓存可复用。同 key 并发生图去重；命中在途任务（多为静默预热）时，非静默调用落定后补发结果
     generate(kind: MediaEvent['kind'], theme: string, opts: GenImgOpts = {}) {
       if (kind === 'scene' && !sceneDescription(theme)) {
         log('genimg', 'rejected empty scene description');
@@ -318,15 +326,29 @@ export function createGenImg(deps: GenImgDeps) {
         return;
       }
       const sceneKey = opts.sceneKey ?? (kind === 'scene' ? safeKey(theme) : kind);
-      const key = `${kind}_${sceneKey}_${crypto
+      const baseKey = `${kind}_${sceneKey}_${crypto
         .createHash('md5')
         .update(
-          'composition-mobile-v4' +
+          'cinematic-scene-only-v8' +
             buildMediaPrompt(kind, styleTemplate, sceneBodies, theme, opts) +
-            (opts.caption ?? ''),
+            (opts.caption ?? '') +
+            (opts.overlay?.url ?? opts.overlay?.file ?? opts.overlay?.base ?? ''),
         )
         .digest('hex')
-        .slice(0, 10)}`;
+        .slice(0, 10)}${kind === 'photo' || kind === 'overlay' ? `_${crypto.randomUUID()}` : ''}`;
+      let key = baseKey;
+      if (kind === 'scene') {
+        const prefix = `${baseKey}_stage3_`;
+        const cached = fs.readdirSync(dir).find((name) => name.startsWith(prefix) && name.endsWith('.jpg'));
+        const layoutKey = path.join(dir, baseKey);
+        const layout =
+          (cached && layoutFromUrl(`/${cached}`)) ||
+          sceneLayouts.get(layoutKey) ||
+          randomSceneLayout(deps.layoutRandom);
+        sceneLayouts.set(layoutKey, layout);
+        opts = { ...opts, layout };
+        key = cached ? cached.slice(0, -4) : `${baseKey}_${layoutToken(layout)}`;
+      }
       const file = path.join(dir, `${key}.jpg`);
       const url = `/media/${key}.jpg`;
 
@@ -364,10 +386,11 @@ export function createGenImg(deps: GenImgDeps) {
         return;
       }
 
-      const p = run(kind, theme, opts);
+      const p = run(kind, theme, opts, key);
       inflight.set(key, p);
       void p.finally(() => {
         if (inflight.get(key) === p) inflight.delete(key);
+        sceneLayouts.delete(path.join(dir, baseKey));
       });
     },
   };

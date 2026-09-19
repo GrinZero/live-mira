@@ -1,3 +1,4 @@
+import { WorldMap } from './ui/WorldMap';
 import { SceneJourney } from './scene/SceneJourney';
 import { SceneBoundary } from './scene/SceneBoundary';
 import { Background } from './scene/Background';
@@ -14,6 +15,7 @@ import { SoundControls } from './ui/SoundControls';
 import { EyeToggle } from './ui/EyeToggle';
 import { EyePreview } from './ui/EyePreview';
 import { ResetButton } from './ui/ResetButton';
+import { OrientationButton } from './ui/OrientationButton';
 import { eyeContact } from './vision/eyeContact';
 
 export default function App() {
@@ -22,6 +24,8 @@ export default function App() {
   const director = useMemo(() => new ClientDirector(isMock), [isMock]);
   const [starting, setStarting] = useState(false);
   const entered = useStore((s) => s.entered);
+  const world = useStore((s) => s.world);
+  const phase = useStore((s) => s.phase);
   const modelReady = useStore((s) => s.modelReady);
   const toast = useStore((s) => s.toast);
   const debugInit = useRef(params.get('debug') === '1');
@@ -52,27 +56,44 @@ export default function App() {
     if (entered) director.engine.setRainLevel(rain);
   }, [rain, entered, director]);
 
-  const onEnter = useCallback(async () => {
+  const onEnter = useCallback(
+    async (freshWorld = false) => {
+      if (starting) return;
+      setStarting(true);
+      // 对视默认开：和麦克风在同一次点击手势里申请摄像头。手动关过（localStorage）就不再自动开；
+      // 摄像头失败不拦进场——她看不见你，演出照常。
+      if (!isMock && localStorage.getItem('mira.eye') !== 'off') {
+        void eyeContact.enable().catch(() => {});
+      }
+      try {
+        await director.start(freshWorld);
+        director.enter();
+      } catch (e) {
+        useStore.getState().set({ toast: `连接失败：${(e as Error).message}` });
+      } finally {
+        setStarting(false);
+      }
+    },
+    [director, starting, isMock],
+  );
+
+  const onReset = useCallback(async () => {
     if (starting) return;
     setStarting(true);
-    // 对视默认开：和麦克风在同一次点击手势里申请摄像头。手动关过（localStorage）就不再自动开；
-    // 摄像头失败不拦进场——她看不见你，演出照常。
-    if (!isMock && localStorage.getItem('mira.eye') !== 'off') {
-      void eyeContact.enable().catch(() => {});
-    }
     try {
-      await director.start();
+      await director.reset();
       director.enter();
     } catch (e) {
       useStore.getState().set({ toast: `连接失败：${(e as Error).message}` });
+    } finally {
       setStarting(false);
     }
-  }, [director, starting, isMock]);
+  }, [director, starting]);
 
   // 断线提示点击重连
   const onScreenTap = useCallback(() => {
     const st = useStore.getState();
-    if (st.phase === 'reconnecting') void (director as unknown as { reconnect?: () => void }).reconnect?.();
+    if (st.phase === 'reconnecting') void director.reconnect();
   }, [director]);
 
   return (
@@ -86,13 +107,21 @@ export default function App() {
       <Flash />
       {entered && (
         <>
+          <WorldMap
+            world={world}
+            onTravel={(id) => director.travelTo(id)}
+            onOpenChange={(open) => director.setMapOpen(open)}
+            onCancel={() => director.cancelTravel()}
+            disabled={phase === 'reconnecting'}
+          />
           <StatePill />
           <div className="top-controls">
             <EyeToggle />
             <EyePreview />
             <SoundControls engine={director.engine} />
-            <ResetButton director={director} />
+            <ResetButton onReset={onReset} />
           </div>
+          <OrientationButton />
           <PhotoCard />
           <div className="conversation-dock">
             <Subtitles />
@@ -102,7 +131,7 @@ export default function App() {
           </div>
         </>
       )}
-      {!entered && <EnterOverlay onEnter={onEnter} ready={!starting && modelReady} mock={isMock} />}
+      {!entered && <EnterOverlay onEnter={onEnter} ready={!starting && modelReady} starting={starting} mock={isMock} />}
       {toast && entered && <div className="toast">{toast}</div>}
       <button
         className="debug-toggle"

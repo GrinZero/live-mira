@@ -669,12 +669,6 @@ canvas {
     opacity: 1;
   }
 }
-.subtitles {
-  left: 8%;
-  right: 43%;
-  bottom: 105px;
-  padding: 0 10px;
-}
 .sub.mira {
   font-size: clamp(18px, 1.8vw, 25px);
 }
@@ -705,27 +699,29 @@ canvas {
     0 1px 10px rgba(0, 0, 0, 0.85),
     0 0 26px rgba(0, 0, 0, 0.55);
 }
-/* 选项是"可以随口说出的话"，不是分支菜单 */
+/* 选项是"可以随口说出的话"，不是分支菜单——视觉上退到自由对话之后 */
 .encounter-choices {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   margin-top: 12px;
 }
 .encounter-choices .say {
   border-radius: 999px;
-  padding: 8px 13px;
-  font-size: 12.5px;
+  padding: 6px 11px;
+  font-size: 12px;
   cursor: pointer;
   text-align: left;
-  color: #eddbc1;
-  background: #10182299;
-  border: 1px solid #c5a8785c;
-  backdrop-filter: blur(10px);
+  color: #d3c5ab;
+  background: #10182255;
+  border: 1px solid #c5a87838;
+  backdrop-filter: blur(8px);
 }
 .encounter-choices .say:hover {
-  background: #1a2432c9;
+  background: #1a2432aa;
+  color: #eddbc1;
+  border-color: #c5a87866;
 }
 .encounter-choices .say:disabled {
   opacity: 0.5;
@@ -1124,6 +1120,32 @@ input:focus-visible {
   border-color: rgba(232, 106, 106, 0.55);
   color: #e8a06a;
 }
+.orientation-btn {
+  display: none;
+  position: absolute;
+  right: 14px;
+  top: calc(env(safe-area-inset-top, 0px) + 72px);
+  z-index: 40;
+  padding: 9px 13px;
+  border: 1px solid rgba(255, 179, 92, 0.42);
+  border-radius: 999px;
+  cursor: pointer;
+  background: rgba(33, 30, 27, 0.84);
+  color: #e4d4bf;
+  font-size: 12px;
+  letter-spacing: 0.05em;
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(10px);
+}
+.orientation-btn:disabled {
+  cursor: default;
+  opacity: 0.58;
+}
+@media (max-width: 767px) {
+  .orientation-btn {
+    display: block;
+  }
+}
 .sound-controls {
   position: relative;
   color: #e4d4bf;
@@ -1188,7 +1210,7 @@ input:focus-visible {
   inset: 0;
   z-index: 3;
   pointer-events: none;
-  background: linear-gradient(105deg, rgba(8, 13, 22, 0.18), rgba(8, 13, 22, 0.88));
+  background: #080d16;
   opacity: 0;
 }
 .scene-journey.departing {
@@ -1207,16 +1229,20 @@ input:focus-visible {
     backdrop-filter: blur(1px);
   }
   100% {
-    opacity: 0.94;
+    opacity: 1;
     backdrop-filter: blur(8px);
   }
 }
 @keyframes journey-in {
   0% {
-    opacity: 0.94;
+    opacity: 1;
     backdrop-filter: blur(8px);
   }
-  38% {
+  18% {
+    opacity: 1;
+    backdrop-filter: blur(8px);
+  }
+  62% {
     opacity: 0.34;
     backdrop-filter: blur(3px);
   }
@@ -1229,4 +1255,32 @@ input:focus-visible {
   .scene-journey {
     animation-duration: 0.001ms;
   }
+}
+
+.enter-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.enter-new {
+  margin-top: 18px;
+  padding: 6px 16px;
+  background: transparent;
+  border: none;
+  color: var(--dim);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.enter-new:hover {
+  color: #ffc778;
+}
+.enter-new:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.enter-new-hint {
+  margin-top: 4px;
+  color: var(--dim);
+  font-size: 11px;
 }

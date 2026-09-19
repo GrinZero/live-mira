@@ -1,0 +1,10 @@
+{
+  "asset": "cafe_map.webp",
+  "created": "2026-09-19",
+  "kind": "AI-generated map illustration",
+  "provider": "Seedream via project Ark image provider",
+  "reference": "cafe_interior.jpg",
+  "pipeline": "server/src/world/runtime.ts drawVisitedRegions",
+  "purpose": "Bundled first visited region; copied into each entered world save",
+  "sourceArtifact": "output/checks/world/generated-cafe.webp"
+}

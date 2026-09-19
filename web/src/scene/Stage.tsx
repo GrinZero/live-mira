@@ -1,3 +1,4 @@
+import { isStagedScene } from '../../../shared/scene-layout';
 import { Suspense, useRef } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
@@ -7,6 +8,7 @@ import { useStore } from '../state/store';
 import type { CharacterActor } from './actor';
 
 // 灯光随剧情联动：暖琥珀主光（室内）+ 冷蓝轮廓光（窗外雨夜）
+const _lightColor = new THREE.Color();
 function Lights() {
   const warm = useRef<THREE.PointLight>(null);
   const cool = useRef<THREE.DirectionalLight>(null);
@@ -16,17 +18,24 @@ function Lights() {
   useFrame((_, dt) => {
     const d = Math.min(dt, 0.05);
     const dim = 1 - fx.dim * 0.72;
-    if (warm.current)
-      warm.current.intensity = THREE.MathUtils.damp(warm.current.intensity, (outside ? 1.8 : 4.5) * dim, 4, d);
-    if (amb.current)
+    // 室外没有咖啡馆那盏琥珀灯：主光换成冷调月色/街灯，她才不会像被室内光贴着
+    if (warm.current) {
+      warm.current.intensity = THREE.MathUtils.damp(warm.current.intensity, (outside ? 1.1 : 4.5) * dim, 4, d);
+      warm.current.color.lerp(_lightColor.set(outside ? '#8d9cc4' : '#ffb35c'), Math.min(1, 4 * d));
+    }
+    if (amb.current) {
       amb.current.intensity = THREE.MathUtils.damp(amb.current.intensity, 0.5 * (1 - fx.dim * 0.5), 4, d);
-    if (cool.current)
+      amb.current.color.lerp(_lightColor.set(outside ? '#48587c' : '#5a6a8c'), Math.min(1, 4 * d));
+    }
+    if (cool.current) {
       cool.current.intensity = THREE.MathUtils.damp(
         cool.current.intensity,
-        (outside ? 2.4 : 1.6) + fx.rain * 0.5,
+        (outside ? 2.6 : 1.6) + fx.rain * 0.5,
         4,
         d,
       );
+      cool.current.color.lerp(_lightColor.set(outside ? '#6f9fd8' : '#4a6db3'), Math.min(1, 4 * d));
+    }
   });
   return (
     <>
@@ -65,6 +74,7 @@ function LightningLight() {
 export const actorRef: { current: CharacterActor | null } = { current: null };
 
 export function Stage() {
+  const staged = useStore((s) => isStagedScene(s.bgUrl));
   const ready = useStore((s) => s.modelReady);
   return (
     <Canvas
@@ -81,7 +91,7 @@ export function Stage() {
         zIndex: 1,
         opacity: ready ? 1 : 0,
         transition: 'opacity 0.8s ease',
-        filter: 'drop-shadow(0 10px 16px rgba(4,8,14,.30)) drop-shadow(2px 2px 2px rgba(3,6,10,.18))',
+        filter: staged ? 'none' : 'drop-shadow(0 10px 16px rgba(4,8,14,.30)) drop-shadow(2px 2px 2px rgba(3,6,10,.18))',
       }}
     >
       <CameraRig />

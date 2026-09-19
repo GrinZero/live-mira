@@ -43,14 +43,14 @@ export function Encounter({ director }: { director: ClientDirector }) {
           <button
             key={choice.id}
             className="say"
-            disabled={phase === 'thinking'}
+            disabled={phase === 'thinking' || phase === 'reconnecting'}
             aria-label={`说：${choice.label}`}
             onClick={() => director.choose(choice.id)}
           >
             「{choice.label}」
           </button>
         ))}
-        <button className="pass" onClick={() => director.choose('dismiss')}>
+        <button className="pass" disabled={phase === 'reconnecting'} onClick={() => director.choose('dismiss')}>
           先不管它
         </button>
       </div>

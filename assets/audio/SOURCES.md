@@ -21,3 +21,21 @@ then uses the Web Audio looping clock. No timer-driven restarts or end/start fad
 The heavy layer starts 43s apart from the base to avoid phase-correlated doubling.
 Speech ducks music to 35% and rain to 82%, across utterances rather than syllable RMS.
 Old rain assets are backed up in `output/audio/original/`.
+
+## Thunder · 2026-09-19
+
+- **Thunder #6**, Joseph SARDIN & Axeline T., BigSoundBank #3179.
+  Source: https://bigsoundbank.com/thunder-6-s3179.html
+  Download: https://bigsoundbank.com/UPLOAD/mp3/3179.mp3
+  Source page identifies a single thunderclap without rain, outdoor recording,
+  SoundDevices MixPre-3 + Sennheiser ME66; license CC0.
+- Archived MP3 distribution copy: `sources/thunder-3179.mp3` (not original WAV).
+  ffprobe: 13.8272 seconds, 48 kHz, mono, MP3; 553293 bytes.
+  SHA-256: `1208860d747a32d321e01f7d77995c06f712f9aace11b139e03e804f97d395fd`.
+- Runtime: `node scripts/prepare-thunder.mjs` produces `thunder.ogg` and
+  `thunder.m4a` with a fixed -3 dB gain. Lightning schedules a non-looping
+  thunderclap after 0.8 seconds; duplicate/overlapping events are suppressed.
+  It uses the ambience bus and bypasses the speech mouth analyser.
+- Decode/metadata checked; subjective listening and in-scene mix acceptance
+  remain pending. This adds a real thunder recording; it does not prove the
+  previously reported abnormal sound has been isolated.

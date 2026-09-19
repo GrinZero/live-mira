@@ -43,6 +43,17 @@ export class ClientDirector {
   private resolveSession?: () => void;
   private rejectSession?: (e: Error) => void;
   private awaitingReset = false; // reset 换会话窗口：新 session 就位前的下行都是旧会话残影
+  private reconnecting = false;
+  private reconnectAttempt = 0;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private mediaTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private expiredMedia = new Set<string>();
+
+  private clearMediaWaits() {
+    for (const timer of this.mediaTimers.values()) clearTimeout(timer);
+    this.mediaTimers.clear();
+    this.overlayRevs.clear();
+  }
 
   constructor(private isMock: boolean) {
     // 日志流按需订阅：调试面板打开时才请求服务端日志（服务端不主动广播）
@@ -51,11 +62,30 @@ export class ClientDirector {
     });
   }
 
-  async start() {
+  private waitForSession() {
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.resolveSession = undefined;
+        this.rejectSession = undefined;
+        reject(new Error('语音会话连接超时，请重试'));
+      }, 15000);
+      this.resolveSession = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      this.rejectSession = (e) => {
+        clearTimeout(timer);
+        reject(e);
+      };
+    });
+  }
+
+  async start(freshWorld = false) {
     const st = useStore.getState();
     if (this.started) return;
     this.started = true;
-    st.set({ phase: 'boot' });
+    this.awaitingReset = false;
+    st.set({ phase: this.reconnecting ? 'reconnecting' : 'boot', toast: '' });
     try {
       await this.engine.init();
       await this.engine.resume();
@@ -83,29 +113,41 @@ export class ClientDirector {
         rt.onAudio = this.onAudioFrame;
         rt.onClose = () => this.onTransportClose();
         await rt.connect();
-        const sessionReady = new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error('语音会话连接超时，请重试')), 15000);
-          this.resolveSession = () => {
-            clearTimeout(timer);
-            resolve();
-          };
-          this.rejectSession = (e) => {
-            clearTimeout(timer);
-            reject(e);
-          };
+        const sessionReady = this.waitForSession();
+        rt.send({
+          type: 'hello',
+          session_id: st.sessionId || undefined,
+          client_token: sessionToken(),
+          fresh_world: freshWorld,
         });
-        rt.send({ type: 'hello', session_id: st.sessionId || undefined, client_token: sessionToken() });
         await sessionReady;
         rt.send({ type: 'mic', muted: useStore.getState().micMuted });
         // 调试面板开着时补订阅：重连后的新 ws 服务端不带日志订阅状态
         if (useStore.getState().debugOpen) rt.send({ type: 'debug' });
       }
     } catch (e) {
+      this.resolveSession = undefined;
+      this.rejectSession = undefined;
       this.started = false;
       this.transport?.close();
       await this.engine.dispose();
       throw e;
     }
+  }
+
+  setMapOpen(open: boolean) {
+    useStore.getState().set({ mapOpen: open });
+    this.transport?.send({ type: 'map.open', open });
+  }
+  travelTo(locationId: string) {
+    const st = useStore.getState();
+    if (!st.world?.locations.some((l) => l.id === locationId)) return;
+    this.interrupt('manual');
+    this.transport?.send({ type: 'travel.request', locationId, intentId: crypto.randomUUID() });
+  }
+  cancelTravel() {
+    const id = useStore.getState().world?.travel?.id;
+    if (id) this.transport?.send({ type: 'travel.cancel', id });
   }
 
   enter() {
@@ -118,11 +160,14 @@ export class ClientDirector {
   // 整场重来：画面/字幕/剧情/会话号全部回到开场，服务端同连接销毁并重建会话。
   // epoch++ 作废在途的指令延迟、照片弹出和转场提交；音频引擎保留（麦克风/雨声不重启）。
   async reset() {
+    this.clearMediaWaits();
+    this.expiredMedia.clear();
     this.epoch++;
     if (this.playbackTimer) clearTimeout(this.playbackTimer);
     this.outputCancelled = true;
     this.audioOpen = false;
     this.engine.stopPlayback();
+    this.engine.stopThunder();
     this.engine.setRainLevel(1);
     this.activeResponse = '';
     this.latestScene = '';
@@ -134,7 +179,9 @@ export class ClientDirector {
     this.silenceFrames = 0;
     if (typeof localStorage !== 'undefined') localStorage.removeItem('mira.sid');
     useStore.getState().set({
-      phase: 'idle',
+      world: null,
+      mapOpen: false,
+      phase: 'boot',
       entered: false,
       sessionId: '',
       resumed: false,
@@ -169,7 +216,18 @@ export class ClientDirector {
       }
       return;
     }
+    const sessionReady = this.waitForSession();
     this.transport?.send({ type: 'reset' });
+    try {
+      await sessionReady;
+      this.transport?.send({ type: 'mic', muted: useStore.getState().micMuted });
+    } catch (e) {
+      this.awaitingReset = false;
+      this.started = false;
+      this.transport?.close();
+      await this.engine.dispose();
+      throw e;
+    }
   }
 
   noteInputActivity() {
@@ -182,6 +240,7 @@ export class ClientDirector {
   };
 
   sendText(text: string) {
+    if (useStore.getState().phase === 'reconnecting') return;
     if (!text.trim()) return;
     this.resumeConversation();
     this.interrupt('manual');
@@ -192,6 +251,7 @@ export class ClientDirector {
   }
 
   choose(id: string) {
+    if (useStore.getState().phase === 'reconnecting') return;
     this.resumeConversation();
     this.interrupt('manual');
     if (id !== 'dismiss') useStore.getState().set({ phase: 'thinking' });
@@ -276,12 +336,32 @@ export class ClientDirector {
   }
 
   private onTransportClose() {
+    this.rejectSession?.(new Error('连接中断，请重试'));
+    if (this.reconnecting || !useStore.getState().entered) return;
+    this.clearMediaWaits();
+    this.latestScene = 'disconnected';
+    this.latestPhoto = 'disconnected';
+    this.pendingPhotoEpoch = -1;
+    this.outputCancelled = true;
+    this.audioOpen = false;
+    this.engine.stopPlayback();
+    this.epoch++;
+    if (this.playbackTimer) clearTimeout(this.playbackTimer);
     const st = useStore.getState();
-    st.set({ phase: 'reconnecting', toast: '连接断了…正在重连' });
-    setTimeout(() => this.reconnect(), 1200);
+    st.finalizeMira(true);
+    st.set({ phase: 'reconnecting', toast: '连接断了…正在重连', generating: [], sceneTransition: null });
+    this.scheduleReconnect();
   }
 
-  private async reconnect() {
+  private scheduleReconnect() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => void this.reconnect(), Math.min(1200 * 2 ** this.reconnectAttempt, 8000));
+  }
+
+  async reconnect() {
+    if (this.reconnecting) return;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnecting = true;
     try {
       this.transport?.close();
     } catch {
@@ -292,11 +372,11 @@ export class ClientDirector {
     useStore.getState().set({ sceneTransition: null });
     this.epoch++;
     if (this.playbackTimer) clearTimeout(this.playbackTimer);
-    await this.engine.dispose();
     try {
+      await this.engine.dispose();
       await this.start();
       const current = useStore.getState();
-      if (!current.resumed) {
+      if (!current.resumed && !current.world?.locations.length) {
         current.set({
           story: null,
           photo: null,
@@ -313,10 +393,22 @@ export class ClientDirector {
           entered: false,
         });
         this.enter();
-      } else current.set({ phase: 'listening' });
+      } else {
+        current.set({ phase: 'listening', entered: false });
+        this.enter();
+      }
       current.set({ toast: '' });
+      this.reconnectAttempt = 0;
     } catch {
-      useStore.getState().set({ toast: '重连失败，点屏幕重试' });
+      this.reconnectAttempt++;
+      const retry = this.reconnectAttempt < 3;
+      useStore
+        .getState()
+        .set({ phase: 'reconnecting', toast: retry ? '暂时还没连上，正在重试…' : '重连失败，点屏幕重试' });
+      if (retry) this.scheduleReconnect();
+      else this.reconnectAttempt = 0;
+    } finally {
+      this.reconnecting = false;
     }
   }
 
@@ -330,9 +422,26 @@ export class ClientDirector {
       else if (m.type !== 'error') return;
     }
     switch (m.type) {
+      case 'world': {
+        if (st.world?.id === m.world.id && st.world.revision > m.world.revision) break;
+        st.set({ world: m.world });
+        break;
+      }
+      case 'travel.cancelled':
+        if (this.latestScene === m.id || st.sceneTransition?.id === m.id) {
+          this.latestScene = `cancelled:${m.id}`;
+          st.set({
+            sceneTransition: null,
+            motion: null,
+            gesture: null,
+            generating: st.generating.filter((g) => g.id !== m.id),
+          });
+        }
+        break;
       case 'session':
         this.resolveSession?.();
         this.resolveSession = undefined;
+        this.rejectSession = undefined;
         st.set({ sessionId: m.session_id, resumed: m.resumed });
         if (typeof localStorage !== 'undefined') localStorage.setItem('mira.sid', m.session_id);
         break;
@@ -408,7 +517,7 @@ export class ClientDirector {
         st.pushLog(m.entry);
         break;
       case 'error':
-        if (m.code === 'busy' && this.rejectSession) {
+        if (this.rejectSession && ['busy', 'duplex_connect', 'world_storage', 'duplex_gone'].includes(m.code)) {
           const reject = this.rejectSession;
           this.rejectSession = undefined;
           this.resolveSession = undefined;
@@ -417,7 +526,9 @@ export class ClientDirector {
         }
         st.set({
           toast: m.message,
-          ...(this.engine.playbackRemainingMs() < 50 ? { phase: 'listening' as const } : {}),
+          ...(st.phase !== 'reconnecting' && this.engine.playbackRemainingMs() < 50
+            ? { phase: 'listening' as const }
+            : {}),
         });
         setTimeout(() => useStore.getState().set({ toast: '' }), 4000);
         break;
@@ -433,12 +544,31 @@ export class ClientDirector {
     setTimeout(() => {
       if (epoch !== this.epoch) return;
       useStore.getState().applyDirective(d);
+      if (d.fx === 'lightning') this.engine.playThunder(crypto.randomUUID(), 0.8);
     }, 60);
   }
 
   private onMedia(m: Extract<DownMessage, { type: 'media.event' }>) {
     const st = useStore.getState();
     const e = m.event;
+    if (this.expiredMedia.has(e.id)) return;
+    if (e.status === 'generating' && (e.kind === 'photo' || e.kind === 'overlay')) {
+      const old = this.mediaTimers.get(e.id);
+      if (old) clearTimeout(old);
+      const timer = setTimeout(() => {
+        this.mediaTimers.delete(e.id);
+        this.onMedia({ type: 'media.event', event: { ...e, status: 'failed', reason: 'client_timeout' } });
+        this.expiredMedia.add(e.id);
+        if (this.expiredMedia.size > 256) this.expiredMedia.delete(this.expiredMedia.values().next().value!);
+      }, 300000);
+      // Do not keep Node protocol tests alive solely for a UI watchdog.
+      (timer as unknown as { unref?: () => void }).unref?.();
+      this.mediaTimers.set(e.id, timer);
+    } else if (e.status !== 'generating') {
+      const timer = this.mediaTimers.get(e.id);
+      if (timer) clearTimeout(timer);
+      this.mediaTimers.delete(e.id);
+    }
     // 前景板是配菜：不占生成提示、失败静默；渲染侧按 sceneKey 对底图，错位即不显示
     if (e.kind === 'foreground') {
       if (e.status === 'ready' && e.url)
@@ -473,6 +603,58 @@ export class ClientDirector {
     }
     if (e.status === 'ready' && e.url) {
       if (e.kind === 'scene') {
+        if (e.travel_id) {
+          if (this.latestScene && this.latestScene !== e.id) return;
+          this.latestScene = e.id;
+          const image = new Image();
+          image.onerror = () => {
+            if (this.latestScene !== e.id) return;
+            if (!e.committed) this.transport?.send({ type: 'scene.presented', id: e.id, ok: false });
+            useStore.getState().set({
+              sceneTransition: null,
+              toast: e.committed ? '已到达的场景暂时无法显示，请重新连接以恢复。' : '新画面暂时打不开，我们还在原处。',
+            });
+          };
+          image.onload = () => {
+            if (this.latestScene !== e.id) return;
+            if (e.committed) {
+              const current = useStore.getState();
+              const l = current.world?.locations.find((l) => l.id === current.world?.currentLocationId);
+              current.set({
+                bgUrl: e.url!,
+                bgKey: e.scene_key || current.bgKey,
+                fg: l?.fgUrl ? { url: l.fgUrl, sceneKey: l.key } : null,
+                overlay: null,
+                photo: null,
+                fx: { rain: l?.environment.rain ?? 1, dim: l?.environment.dim ?? 0, lightning: 0 },
+                sceneTransition: { id: e.id, phase: 'arriving', startedAt: Date.now() },
+              });
+              setTimeout(() => {
+                if (this.latestScene === e.id) useStore.getState().set({ sceneTransition: null });
+              }, SCENE_ARRIVE_MS);
+            } else {
+              const depart = () => {
+                if (this.latestScene !== e.id) return;
+                const current = useStore.getState();
+                if (current.phase === 'speaking' || current.phase === 'thinking') {
+                  setTimeout(depart, 250);
+                  return;
+                }
+                current.set({
+                  motion: null,
+                  gesture: null,
+                  sceneTransition: { id: e.id, phase: 'departing', startedAt: Date.now() },
+                });
+                setTimeout(() => {
+                  if (this.latestScene === e.id) this.transport?.send({ type: 'scene.presented', id: e.id, ok: true });
+                }, SCENE_DEPART_MS);
+              };
+              depart();
+            }
+          };
+          image.src = e.url;
+          return;
+        }
         if (e.id !== 'restore' && this.latestScene && this.latestScene !== e.id) return;
         this.latestScene = e.id;
         const preload = new Image();
@@ -484,6 +666,22 @@ export class ClientDirector {
               bgUrl: e.url!,
               bgKey: e.scene_key ?? st.bgKey,
               overlay: null,
+              fg:
+                e.id === 'restore'
+                  ? useStore.getState().fg?.sceneKey === e.scene_key
+                    ? useStore.getState().fg
+                    : (() => {
+                        const l = useStore.getState().world?.locations.find((l) => l.key === e.scene_key);
+                        return l?.fgUrl ? { url: l.fgUrl, sceneKey: l.key } : null;
+                      })()
+                  : null,
+              fx: {
+                ...useStore.getState().fx,
+                ...(useStore
+                  .getState()
+                  .world?.locations.find((l) => l.id === useStore.getState().world?.currentLocationId)?.environment ||
+                  {}),
+              },
               sceneTransition: e.id === 'restore' ? null : { id: e.id, phase: 'arriving', startedAt: Date.now() },
             });
             if (e.id === 'restore') return;
@@ -532,6 +730,7 @@ export class ClientDirector {
   // overlay = 当前底图的 i2i 编辑（事件直接发生在画面里）：先 preload 再上屏。
   // 生成期间转场（scene_key 不符）或剧情翻页（moment 的 revision 对不上）就不再浮现。
   private onOverlay(e: MediaEvent) {
+    const epoch = this.epoch;
     const st = useStore.getState();
     if (e.status === 'generating') {
       if (e.purpose === 'moment') this.overlayRevs.set(e.id, st.story?.revision ?? -1);
@@ -546,6 +745,7 @@ export class ClientDirector {
     const ttl = e.ttl_ms ?? 60000;
     const preload = new Image();
     preload.onload = () => {
+      if (epoch !== this.epoch) return;
       const cur = useStore.getState();
       if (e.scene_key && e.scene_key !== cur.bgKey) return;
       if (e.purpose === 'moment' && rev !== undefined && (cur.story?.revision ?? -1) !== rev) return;

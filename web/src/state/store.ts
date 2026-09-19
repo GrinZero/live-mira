@@ -1,3 +1,4 @@
+import type { WorldView } from '../../../shared/world';
 import { create } from 'zustand';
 import {
   gestureForLegacy,
@@ -19,6 +20,8 @@ export interface Subtitle {
 }
 
 interface Store {
+  world: WorldView | null;
+  mapOpen: boolean;
   phase: ClientPhase;
   sceneTransition: { id: string; phase: 'preparing' | 'departing' | 'arriving'; startedAt: number } | null;
   story: StoryView | null;
@@ -62,6 +65,8 @@ let sid = 0;
 const nextId = () => ++sid;
 
 export const useStore = create<Store>((set, _get) => ({
+  world: null,
+  mapOpen: false,
   phase: 'boot',
   sceneTransition: null,
   story: null,

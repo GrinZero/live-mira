@@ -3,7 +3,22 @@ import { useStore } from '../state/store';
 import { authStatus, authLogin } from '../net/auth';
 
 // 进场页：标题 + 口令（服务端开启 ACCESS_TOKENS 时）+ 轻触进入（同时解锁 AudioContext / 麦克风）
-export function EnterOverlay({ onEnter, ready, mock }: { onEnter: () => void; ready: boolean; mock: boolean }) {
+export function EnterOverlay({
+  onEnter,
+  ready,
+  starting,
+  mock,
+}: {
+  onEnter: (freshWorld: boolean) => void;
+  ready: boolean;
+  starting: boolean;
+  mock: boolean;
+}) {
+  const sessionId = useStore((s) => s.sessionId);
+  const [hasSavedStory, setHasSavedStory] = useState(false);
+  const [checkingStory, setCheckingStory] = useState(true);
+  const [storyError, setStoryError] = useState(false);
+  const [retry, setRetry] = useState(0);
   const toast = useStore((s) => s.toast);
   const [needCode, setNeedCode] = useState(false);
   const [code, setCode] = useState('');
@@ -13,6 +28,37 @@ export function EnterOverlay({ onEnter, ready, mock }: { onEnter: () => void; re
   useEffect(() => {
     void authStatus().then((s) => setNeedCode(s.required && !s.ok));
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setCheckingStory(true);
+    setStoryError(false);
+    const check = async () => {
+      const token = localStorage.getItem('mira.ct');
+      if (mock || !token) return false;
+      const response = await fetch('/api/story', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client_token: token }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) throw new Error('story unavailable');
+      return Boolean((await response.json()).exists);
+    };
+    void check()
+      .then((exists) => {
+        if (!cancelled) setHasSavedStory(exists);
+      })
+      .catch(() => {
+        if (!cancelled) setStoryError(true);
+      })
+      .finally(() => {
+        if (!cancelled) setCheckingStory(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mock, sessionId, needCode, retry]);
 
   const submit = async () => {
     const t = code.trim();
@@ -56,9 +102,40 @@ export function EnterOverlay({ onEnter, ready, mock }: { onEnter: () => void; re
             {err && <div className="enter-toast">{err}</div>}
           </>
         ) : (
-          <button className="enter-btn" onClick={onEnter} disabled={!ready}>
-            {ready ? '轻触进入' : '加载中…'}
-          </button>
+          <div className="enter-actions">
+            <button
+              className="enter-btn"
+              onClick={() => onEnter(!hasSavedStory)}
+              disabled={!ready || checkingStory || storyError}
+            >
+              {starting
+                ? '连接中…'
+                : checkingStory
+                  ? '读取进度…'
+                  : !ready
+                    ? '加载中…'
+                    : hasSavedStory
+                      ? '继续上次'
+                      : '开始新故事'}
+            </button>
+            {storyError && (
+              <button className="enter-new" onClick={() => setRetry((n) => n + 1)}>
+                进度读取失败，点击重试
+              </button>
+            )}
+            {hasSavedStory && (
+              <>
+                <button
+                  className="enter-new"
+                  onClick={() => onEnter(true)}
+                  disabled={!ready || checkingStory || storyError}
+                >
+                  开始新故事
+                </button>
+                <div className="enter-new-hint">从咖啡馆重新开始，重置本次对话与足迹</div>
+              </>
+            )}
+          </div>
         )}
         <div className="enter-hint">
           {needCode

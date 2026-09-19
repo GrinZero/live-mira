@@ -49,7 +49,14 @@ export function PhotoCard() {
   return (
     <section className="photo-card" aria-label="一起看照片">
       <div className="photo-frame">
-        <img src={photo.url} alt={photo.caption || 'Mira 展示的照片'} />
+        <img
+          src={photo.url}
+          alt={photo.caption || 'Mira 展示的照片'}
+          onError={() => {
+            if (useStore.getState().photo?.url === photo.url)
+              useStore.getState().set({ photo: null, toast: '照片暂时打不开，可以继续聊，稍后再看。' });
+          }}
+        />
         {photo.caption && <div className="photo-caption">{photo.caption}</div>}
         <button className="photo-close" onClick={() => useStore.getState().set({ photo: null })}>
           看好了，放回去 ↙
