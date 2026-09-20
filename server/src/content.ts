@@ -29,7 +29,7 @@ export interface Content {
   openingLines: string[];
   proactiveLines: string[];
   proactiveCues: string[];
-  degradeLines: { genimg_timeout: string; genimg_bad: string; reconnect: string };
+  degradeLines: { genimg_timeout: string; genimg_bad: string; reconnect: string; reply_failed: string };
   styleTemplate: string;
   sceneBodies: Record<string, string>;
 }
@@ -38,7 +38,7 @@ function parseLines(md: string): {
   opening: string[];
   proactive: string[];
   cues: string[];
-  degrade: { genimg_timeout: string; genimg_bad: string; reconnect: string };
+  degrade: Content['degradeLines'];
 } {
   // 提取所有 ``` 块，按出现顺序归入所在小节
   const sections = md.split(/^## /m);
@@ -48,10 +48,11 @@ function parseLines(md: string): {
     return [...sec.matchAll(/```\n([\s\S]*?)```/g)].map((m) => m[1].trim().replace(/\n/g, ''));
   };
   const degrade = grab('降级圆场');
-  const d: { genimg_timeout: string; genimg_bad: string; reconnect: string } = {
+  const d: Content['degradeLines'] = {
     genimg_timeout: degrade[0] || '……信号不好，照片传不过来。等它愿意来再看吧。',
     genimg_bad: degrade[1] || '这张洗坏了。算了——有些地方只留在记忆里更清楚。',
     reconnect: degrade[2] || '你刚才说什么？——刚才雨声太大，没听清。',
+    reply_failed: degrade[3] || '刚才你说什么？我没听清。',
   };
   return { opening: grab('开场'), proactive: grab('主动开口'), cues: grab('提示池'), degrade: d };
 }

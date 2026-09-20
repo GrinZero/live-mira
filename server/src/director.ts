@@ -564,7 +564,7 @@ export class Director {
         traceEvent('director.stale', { revision, currentRevision: this.revision });
         return;
       }
-      const line = '刚才卡了一下，你这句话我还没接上。可以再说一次吗？';
+      const line = this.content.degradeLines.reply_failed;
       this.hooks.injectTurnPair(userText, line);
       this.hooks.speak(line);
       this.noteMira(line);

@@ -11,3 +11,7 @@ coverage/
 *.tsbuildinfo
 *.log
 .DS_Store
+.agents/
+.media/
+tmp/
+skills-lock.json

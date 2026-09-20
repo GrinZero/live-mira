@@ -39,6 +39,37 @@ function harness(
   return { d: new Director(loadContent(), hooks, chat, decide), spoken, media, contexts, narrations };
 }
 
+test('provider failure stays in character and a later turn recovers normally', async () => {
+  let calls = 0;
+  const { d, spoken } = harness(async () => {
+    if (++calls === 1) throw new Error('provider unavailable');
+    return '{"reply":"我喜欢坐在窗边听雨。"}';
+  });
+  await d.handleTextTurn('你喜欢雨天吗？');
+  assert.equal(spoken.length, 1);
+  assert.match(spoken[0], /没听清/);
+  assert.doesNotMatch(spoken[0], /卡了|接口|API|超时|网络|服务/);
+  assert.equal(d.turns.filter((t) => t.role === 'user').length, 1);
+  await d.handleTextTurn('我是问你喜欢雨天吗？');
+  assert.equal(spoken.at(-1), '我喜欢坐在窗边听雨。');
+  assert.equal(calls, 2);
+});
+
+test('late provider failure cannot speak a fallback over newer user activity', async () => {
+  let reject!: (e: Error) => void;
+  const { d, spoken } = harness(
+    () =>
+      new Promise((_resolve, fail) => {
+        reject = fail;
+      }),
+  );
+  const pending = d.handleTextTurn('旧问题');
+  d.noteUserActivity();
+  reject(new Error('timeout'));
+  await pending;
+  assert.deepEqual(spoken, []);
+});
+
 test('world is generated, choices are optional, results require the exact current utterance', () => {
   const s = new Story();
   assert.equal(
