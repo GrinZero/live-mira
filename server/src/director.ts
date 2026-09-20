@@ -1,6 +1,9 @@
+import { traceEvent, traceOperation } from './telemetry.js';
 import { arkChat } from './ark.js';
 import { log } from './log.js';
 import { pick, type Decide } from './decisions.js';
+import type { PhotoJudge } from './semantic/photo.js';
+import { PhotoCoordinator } from './media/photo-coordinator.js';
 import { stripStage } from './duplex.js';
 import { Story, isWorldAction, isTravelAction, sceneDescription, environmentOnly, type WorldUpdate } from './story.js';
 import type { Content } from './content.js';
@@ -40,8 +43,6 @@ export class Director {
   private pendingScene = '';
   private miraFacts: string[] = [];
   pendingMedia = false;
-  photoArmed = false;
-  private photoSubject = '';
   lastSpeechEnd = Date.now();
   lastUserAt = 0;
   readonly story: Story;
@@ -52,7 +53,7 @@ export class Director {
   private pendingQuestion = '';
   private facts: string[] = []; // Exact user quotes only; never inferred biographical facts.
   private textInFlight = 0;
-  private lastPhotoAt = 0;
+  private readonly photo: PhotoCoordinator;
   private nextEventDelayMs = 80000;
   private invites = 0;
   private startedAt = Date.now();
@@ -67,6 +68,7 @@ export class Director {
   private reactionBlockedUntil = 0;
   private lastReactionAt = 0;
   private sceneIntent = 'unknown';
+  private sceneIntentConfidence = 0;
   private cadence?: {
     revision: number;
     playedAt?: number;
@@ -81,8 +83,20 @@ export class Director {
     private hooks: DirectorHooks,
     private chat: typeof arkChat = arkChat,
     private decide: Decide | null = null,
+    private photoJudge: PhotoJudge | null = null,
   ) {
     this.story = new Story();
+    this.photo = new PhotoCoordinator({
+      judge: photoJudge,
+      getRevision: () => this.revision,
+      hasPendingMedia: () => this.pendingMedia,
+      newMedia: () => this.newMedia(),
+      onImmediatePhoto: (photo) =>
+        this.hooks.genimg('photo', photo.subject, { caption: photo.caption, contextId: photo.contextId }),
+    });
+  }
+  get photoArmed() {
+    return this.photo.photoArmed;
   }
   get instructions() {
     return this.content.personaInstructions;
@@ -153,19 +167,7 @@ export class Director {
       this.facts = [...this.facts, text].slice(-24);
     }
     this.syncContext();
-    if (
-      /(看看|看一下|给我看|展示).*(照片|拍的)|照片.*(看看|给我)/.test(text) &&
-      !/(不要|别|不想)/.test(text) &&
-      Date.now() - this.lastPhotoAt > 15000
-    ) {
-      this.lastPhotoAt = Date.now();
-      this.photoSubject = `Mira 手机或钱包里的一张照片，画面内容由这句话指定：${text.slice(0, 150)}`;
-      this.photoArmed = true;
-      if (fromText) {
-        const photo = this.consumeArmedPhoto()!;
-        this.hooks.genimg('photo', photo.subject, { caption: photo.caption, contextId: photo.contextId });
-      }
-    }
+    this.photo.noteUser(utterance, fromText);
     return utterance;
   }
   choose(id: string): string | null {
@@ -220,8 +222,12 @@ export class Director {
         },
         this.decisionAbort.signal,
       );
-      if (revision !== this.revision) return;
+      if (revision !== this.revision) {
+        traceEvent('director.stale', { revision, currentRevision: this.revision });
+        return;
+      }
       this.sceneIntent = pick(answers, 'intent', 'unknown');
+      this.sceneIntentConfidence = answers.intent?.confidence ?? 0;
       const quiet = pick(answers, 'quiet', 'keep', 0.85);
       if (quiet === 'enter') this.quietPreference = true;
       if (quiet === 'resume' || (this.sceneIntent === 'question' && answers.intent!.confidence >= 0.9))
@@ -337,8 +343,7 @@ export class Director {
           speech.length <= 180 &&
           speech !== last.text &&
           !RELATIONSHIP_HINT.test(speech) &&
-          !INDIRECT_HINT.test(speech) &&
-          !PHOTO_OFFER.test(speech)
+          !INDIRECT_HINT.test(speech)
         ) {
           c.mode = 'continue';
           c.speech = speech;
@@ -527,15 +532,26 @@ export class Director {
         maxTokens: 800,
         timeoutMs: 15000,
       });
-      if (revision !== this.revision) return;
+      if (revision !== this.revision) {
+        traceEvent('director.stale', { revision, currentRevision: this.revision });
+        return;
+      }
       const result = parseObject(raw);
       const line = spokenLine(result?.reply);
+      await this.reactionTask;
       if (line && result?.world) this.applyWorld(result.world, utterance, line);
       // Some dialogue models agree verbally but omit the world update. Reconcile an
       // explicit action in a focused pass, so 'let us go' cannot remain a cosmetic reply.
-      if (line && (!result?.world || result.world.action === 'none') && explicitAction(utterance)) {
+      if (
+        line &&
+        (!result?.world || result.world.action === 'none') &&
+        explicitAction(utterance, this.sceneIntent, this.sceneIntentConfidence, line)
+      ) {
         await this.handleVoiceWorld(utterance, line);
-        if (revision !== this.revision) return;
+        if (revision !== this.revision) {
+          traceEvent('director.stale', { revision, currentRevision: this.revision });
+          return;
+        }
       }
       if (!line) throw new Error('empty reply');
       this.hooks.injectTurnPair(userText, line);
@@ -544,7 +560,10 @@ export class Director {
       this.hooks.sendDirective({ emotion: this.story.quiet ? 'warm' : 'soft_smile', camera: 'idle_drift' });
       log('director', `text reply: ${line.slice(0, 100)}`);
     } catch (e) {
-      if (revision !== this.revision) return;
+      if (revision !== this.revision) {
+        traceEvent('director.stale', { revision, currentRevision: this.revision });
+        return;
+      }
       const line = '刚才卡了一下，你这句话我还没接上。可以再说一次吗？';
       this.hooks.injectTurnPair(userText, line);
       this.hooks.speak(line);
@@ -555,23 +574,46 @@ export class Director {
     }
   }
   private applyWorld(world: WorldUpdate, userText: string, miraReply = '') {
+    traceEvent('world.proposal', {
+      world,
+      userText,
+      miraReply,
+      intent: this.sceneIntent,
+      confidence: this.sceneIntentConfidence,
+      revision: this.revision,
+    });
     world = {
       ...world,
       scene_prompt: environmentOnly(world.scene_prompt),
       visual_prompt: sceneDescription(world.visual_prompt),
     };
-    if (this.story.phase === 'farewell') return;
-    if (world.action === 'resolve' && !isWorldAction(userText)) return;
+    if (this.story.phase === 'farewell') {
+      traceEvent('world.rejected', { reason: 'farewell' });
+      return;
+    }
+    if (
+      world.action === 'resolve' &&
+      !isWorldAction(userText, this.sceneIntent, this.sceneIntentConfidence, miraReply)
+    ) {
+      traceEvent('world.rejected', { reason: 'not_world_action' });
+      return;
+    }
     if (
       world.scene_prompt &&
-      (!isTravelAction(userText) ||
+      (!isTravelAction(userText, this.sceneIntent, this.sceneIntentConfidence, miraReply) ||
         /(不一起|不去了|不能去|不方便|你(先|自己|慢)走|我.*(留在|留这|还得))/.test(miraReply))
-    )
+    ) {
+      traceEvent('world.rejected', { reason: 'travel_not_authorized_or_reply_declined' });
       return;
+    }
     // A generated destination is only a proposal until the client prepares it and
     // Session commits arrival. Never turn a provider's past-tense claim into fact.
     if (world.scene_prompt) world = { ...world, consequence: '正在准备前往新的地点，尚未抵达。' };
-    if (world.action === 'resolve' && this.story.resolve(world, userText)) {
+    if (
+      world.action === 'resolve' &&
+      this.story.resolve(world, userText, this.sceneIntent, this.sceneIntentConfidence, miraReply)
+    ) {
+      traceEvent('world.accepted', world);
       this.hooks.story(this.story.view());
       this.hooks.narrateToClient(this.story.consequence);
       this.syncContext();
@@ -590,12 +632,30 @@ export class Director {
       this.story.dismiss();
       this.hooks.story(this.story.view());
       this.syncContext();
+    } else {
+      traceEvent('world.rejected', { reason: 'story_did_not_resolve', world, userText });
     }
   }
   // Native speech keeps the low latency audio path; a separate world pass establishes
   // lasting effects with a revision guard, so old decisions cannot overwrite new speech.
   async handleVoiceWorld(userText: string, miraReply = '') {
-    if (!isWorldAction(userText)) return;
+    return traceOperation('director.voice_world', { userText, miraReply }, () =>
+      this.handleVoiceWorldTraced(userText, miraReply),
+    );
+  }
+
+  private async handleVoiceWorldTraced(userText: string, miraReply: string) {
+    await this.reactionTask;
+    if (!isWorldAction(userText, this.sceneIntent, this.sceneIntentConfidence, miraReply)) {
+      traceEvent('world.skipped', {
+        reason: 'not_world_action',
+        userText,
+        miraReply,
+        intent: this.sceneIntent,
+        confidence: this.sceneIntentConfidence,
+      });
+      return;
+    }
     const revision = this.revision,
       task = ++this.worldTask;
     try {
@@ -605,11 +665,21 @@ export class Director {
         maxTokens: 650,
         timeoutMs: 12000,
       });
-      if (revision !== this.revision || task !== this.worldTask) return;
+      if (revision !== this.revision || task !== this.worldTask) {
+        traceEvent('world.skipped', {
+          reason: 'stale_revision_or_task',
+          revision,
+          currentRevision: this.revision,
+          task,
+          currentTask: this.worldTask,
+        });
+        return;
+      }
       const result = parseObject(raw);
       if (result) this.applyWorld(result as unknown as WorldUpdate, userText, miraReply);
+      else traceEvent('world.rejected', { reason: 'invalid_model_json', raw });
     } catch {
-      /* No invented outcome on a failed request. */
+      traceEvent('world.skipped', { reason: 'provider_error' });
     }
   }
   private newMedia() {
@@ -643,33 +713,31 @@ export class Director {
     this.pendingMedia = this.activeMedia.size > 0;
   }
   consumeArmedPhoto(): { subject: string; caption: string; contextId: string } | null {
-    if (!this.photoArmed) return null;
-    this.photoArmed = false;
-    return { subject: this.photoSubject, caption: '今晚，慢慢看。', contextId: this.newMedia() };
+    return this.photo.consume();
   }
   // "递照片"兜底：她的台词或 show_photo 动作表达了展示意图却没调工具时补上，
   // 避免她说了"喏，这张"而对面什么也没看见。主体尽量由她的原话指定。
-  armPhotoFromSpeech(line = '', force = false) {
-    const clean = stripStage(line).trim();
-    const offered = PHOTO_OFFER.test(clean);
-    if (this.photoArmed) {
-      if (clean && offered) this.photoSubject = `Mira 照片里拍下的内容，画面由她这句台词指定：${clean.slice(0, 150)}`;
-      return;
-    }
-    if (!force && !offered) return;
-    if (this.pendingMedia || Date.now() - this.lastPhotoAt < 15000) return;
-    this.lastPhotoAt = Date.now();
-    this.photoSubject = clean
-      ? `Mira 照片里拍下的内容，画面由她这句台词指定：${clean.slice(0, 150)}`
-      : 'Mira 相机里的一张照片：旅途中拍下的一个瞬间，有故事感';
-    this.photoArmed = true;
+  async armPhotoFromSpeech(line = '', force = false) {
+    return this.photo.armFromSpeech(line, force, {
+      recentTurns: this.turns.slice(-6),
+      scene: this.sceneDescription,
+      signal: this.decisionAbort.signal,
+    });
+  }
+
+  photoReplyRejected(reply: string): boolean | Promise<boolean> {
+    return this.photo.photoReplyRejected(reply, {
+      recentTurns: this.turns.slice(-6),
+      scene: this.sceneDescription,
+      signal: this.decisionAbort.signal,
+    });
   }
   // 工具路径已生成照片：记下时间戳并解除兜底，本回合台词检测不再叠第二张
   notePhotoDispatched() {
-    if (this.pendingMedia || (!this.photoArmed && Date.now() - this.lastPhotoAt < 15000)) return false;
-    this.lastPhotoAt = Date.now();
-    this.photoArmed = false;
-    return true;
+    return this.photo.notePhotoDispatched();
+  }
+  clearPhoto() {
+    this.photo.clear();
   }
   degradeFor(_kind: 'timeout' | 'bad') {
     this.pendingMedia = false;
@@ -680,12 +748,10 @@ const WORLD_PROMPT = `你维护开放的共同世界，没有预设剧情或固�
 世界更新格式：{"action":"resolve|dismiss|none","evidence":"最新用户原话，必须逐字一致","consequence":"已经发生的具体结果","scene_prompt":"仅双方确实去新地方时的新场景描述，否则省略","visual_prompt":"值得共同看见的局部结果或物件近景，否则省略"}。
 你不是演员，不回答用户，不编写Mira的对白、动作表演、回忆或心理描写。consequence只能是1句简短的外部世界变化，禁止引号内台词和“她说”等转述。夸赞照片、评价、感谢、问经历、年龄、职业、感受等普通聊天必须none。未移动时省略scene_prompt，禁止填字符串“无”或“none”。scene_prompt仅是明确移动目的地的画面提示，绝不能填Mira的回答。
 用户明确做了或同意了某件事才 resolve。接住自由提议，不限制在选项中。用户只是提问、猜想、举例、否定、拒绝或说以后再去，不得转场，不得把它当成已发生；none即可。需要询问对方才能成立的后果也不要擅自写成事实。
+“要不要跟我/我们一起去……”这类带问号的同行邀请由JEV归为action，但必须等actual_mira_reply明确答应（如“走呗”“走吧”“我陪你去”）后才resolve；拒绝或犹豫仍是none。
 “我们现在出发吧”“我们一起推门出去”是明确行动，应resolve；不能口头答应却不更新世界。明确离开当前场景时必须提供scene_prompt。
 actual_mira_reply是演员本回合实际说出的回应，优先级高于你的设想；她拒绝同行时不得写成双方出发。用户单独告别不转场，停留在告别画面。
 只改变用户参与的事情，不额外添事故、人物关系或用户情绪。保持已有地点、人物事实、历史后果一致。用户改话题不用强行处理事件；明确说不参与可dismiss。场景未就绪时台词表达准备行动，不说已经抵达。生成图片可花时间，不声称用户已看见。`;
-
-// 台词里"把照片递到眼前"的信号：展示语气词/给对方看/指示照片类扁平物
-const PHOTO_OFFER = /(喏|诺|呐)|给(你|您)看|看看?这|这(一)?张|掏出|翻出|拿给|合照|旧照片|照片.{0,8}(给|看)/;
 
 // Shared history belongs in answers to the user, never unsolicited director beats.
 const RELATIONSHIP_HINT =
@@ -694,11 +760,8 @@ const RELATIONSHIP_HINT =
 // Even indirect clues wait until the encounter has room for them.
 const INDIRECT_HINT = /以前有个|从前有个|那个人|问雨的记忆|旧物|旧歌|熟悉的歌|老板娘.{0,8}(认得|认识)|名字.{0,12}想起/;
 
-function explicitAction(text: string) {
-  return (
-    /(我们|一起|现在|我|带|陪).*(去|走|出门|出去|出发|到|回|推门|拿起|打开|写下|放下|看看|逛逛)/.test(text) &&
-    !/(如果|假如|假设|以后|改天|不要|不想|别|吗|？|\?)/.test(text)
-  );
+function explicitAction(text: string, intent = 'unknown', intentConfidence = 0, miraReply = '') {
+  return isTravelAction(text, intent, intentConfidence, miraReply);
 }
 
 function parseObject(raw: string): Record<string, any> | null {

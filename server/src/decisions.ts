@@ -1,6 +1,8 @@
+import { traceOperation } from './telemetry.js';
 import { choice, TypeSafeClient, type ChoiceQuestion, type EntryType } from '@typesafe-ai/sdk';
 import { config } from './config.js';
 import { log } from './log.js';
+import { photoCriteria } from './semantic/photo.js';
 
 const TYPESAFE_TIMEOUT_MS = 2200;
 
@@ -9,7 +11,8 @@ export const criteria = {
     quiet: '用户现在明确希望安静陪伴、停止说话或休息，不是描述环境安静。',
     question: '用户向Mira提问，期待回答。',
     sharing: '用户分享经历、感受或普通交流。',
-    action: '请求具体动作、物件互动或出行；只分类，不代表授权执行。',
+    action:
+      '请求具体动作、物件互动或出行；包括“要不要跟我/我们一起……”，即使句式带问号也属于行动邀请；只分类，不代表授权执行。',
     farewell: '用户明确结束本次交流。',
     unknown: '没有足够证据，或含义不明确。',
   },
@@ -24,6 +27,7 @@ export const criteria = {
     window: '用户明确邀请共同看窗外或听雨，且当前场景有窗。',
     soften: '温和表情回应明确的善意；不推断用户心理。',
   },
+  ...photoCriteria,
   cadence: {
     yield: '已经说完整、问了问题、发出邀请或不确定；把话交给用户。默认选择。',
     quiet: '当前适合安静陪伴，用户要求休息或情绪倾诉已经得到回应。',
@@ -31,7 +35,7 @@ export const criteria = {
   },
 } as const;
 
-export type DecisionStage = 'reaction' | 'cadence';
+export type DecisionStage = 'reaction' | 'cadence' | 'media';
 export type DecisionName = keyof typeof criteria;
 export type DecisionAnswer = { choice: string; confidence: number };
 export type DecisionAnswers = Partial<Record<DecisionName, DecisionAnswer>>;
@@ -84,7 +88,12 @@ export function pick(answers: DecisionAnswers, name: DecisionName, fallback: str
 
 export const jevDecide: Decide = async (stage, state, signal) => {
   if (!typesafeClient) throw new Error('typesafe: TYPESAFE_API_KEY is not configured');
-  const names: DecisionName[] = stage === 'reaction' ? ['intent', 'quiet', 'reaction'] : ['cadence'];
+  const names: DecisionName[] =
+    stage === 'reaction'
+      ? ['intent', 'quiet', 'reaction']
+      : stage === 'media'
+        ? ['photo_request', 'photo_response']
+        : ['cadence'];
   const questions = Object.fromEntries(
     names.map((name) => [
       name,
@@ -95,9 +104,11 @@ export const jevDecide: Decide = async (stage, state, signal) => {
     ]),
   ) as unknown as Record<string, ChoiceQuestion>;
   const started = Date.now();
-  const response = await typesafeClient.systemOne(
-    { model: config.typesafeModel, state: toTypeSafeState(state), questions },
-    { signal, timeout: TYPESAFE_TIMEOUT_MS, retry: { maxRetries: 0 } },
+  const response = await traceOperation('semantic.' + stage, { model: config.typesafeModel, state, questions }, () =>
+    typesafeClient.systemOne(
+      { model: config.typesafeModel, state: toTypeSafeState(state), questions },
+      { signal, timeout: TYPESAFE_TIMEOUT_MS, retry: { maxRetries: 0 } },
+    ),
   );
   const answers = parseAnswers(response, names);
   log('director', `jev ${stage} ${Date.now() - started}ms`, answers);

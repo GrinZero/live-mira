@@ -1,4 +1,5 @@
 import { useStore } from '../state/store';
+import { stripStage } from '../../../shared/spoken-text';
 
 // 字幕区：下三分之一。Mira 台词主显，用户转写次显，旁白淡入淡出
 export function Subtitles() {
@@ -26,7 +27,7 @@ export function Subtitles() {
       {phase === 'thinking' && <div className="sub mira thinking">…</div>}
       {mira && (
         <div className={`sub mira ${mira.interrupted ? 'interrupted' : ''}`} key={mira.id}>
-          {mira.text}
+          {stripStage(mira.text)}
         </div>
       )}
     </div>

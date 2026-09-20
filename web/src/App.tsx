@@ -1,3 +1,4 @@
+import { DiagnosticsButton } from './ui/DiagnosticsButton';
 import { WorldMap } from './ui/WorldMap';
 import { SceneJourney } from './scene/SceneJourney';
 import { SceneBoundary } from './scene/SceneBoundary';
@@ -119,6 +120,7 @@ export default function App() {
             <EyeToggle />
             <EyePreview />
             <SoundControls engine={director.engine} />
+            <DiagnosticsButton />
             <ResetButton onReset={onReset} />
           </div>
           <OrientationButton />
@@ -130,6 +132,11 @@ export default function App() {
             <InputBar director={director} />
           </div>
         </>
+      )}
+      {!entered && (
+        <div style={{ position: 'fixed', top: 16, right: 16, zIndex: 100 }}>
+          <DiagnosticsButton />
+        </div>
       )}
       {!entered && <EnterOverlay onEnter={onEnter} ready={!starting && modelReady} starting={starting} mock={isMock} />}
       {toast && entered && <div className="toast">{toast}</div>}

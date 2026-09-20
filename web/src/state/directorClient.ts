@@ -58,6 +58,21 @@ export class ClientDirector {
   constructor(private isMock: boolean) {
     // 日志流按需订阅：调试面板打开时才请求服务端日志（服务端不主动广播）
     useStore.subscribe((s, prev) => {
+      if (
+        s.sceneTransition !== prev.sceneTransition ||
+        s.bgUrl !== prev.bgUrl ||
+        s.phase !== prev.phase ||
+        s.toast !== prev.toast
+      ) {
+        this.transport?.report?.('state', {
+          at: Date.now(),
+          phase: s.phase,
+          sceneTransition: s.sceneTransition,
+          bgUrl: s.bgUrl,
+          bgKey: s.bgKey,
+          toast: s.toast,
+        });
+      }
       if (s.debugOpen && !prev.debugOpen) this.transport?.send({ type: 'debug' });
     });
   }
@@ -608,6 +623,7 @@ export class ClientDirector {
           this.latestScene = e.id;
           const image = new Image();
           image.onerror = () => {
+            this.transport?.report?.('image.error', { id: e.id, url: e.url, latestScene: this.latestScene });
             if (this.latestScene !== e.id) return;
             if (!e.committed) this.transport?.send({ type: 'scene.presented', id: e.id, ok: false });
             useStore.getState().set({
@@ -616,6 +632,7 @@ export class ClientDirector {
             });
           };
           image.onload = () => {
+            this.transport?.report?.('image.loaded', { id: e.id, url: e.url, latestScene: this.latestScene });
             if (this.latestScene !== e.id) return;
             if (e.committed) {
               const current = useStore.getState();
@@ -659,6 +676,7 @@ export class ClientDirector {
         this.latestScene = e.id;
         const preload = new Image();
         preload.onload = () => {
+          this.transport?.report?.('image.loaded', { id: e.id, url: e.url, latestScene: this.latestScene });
           if (this.latestScene !== e.id) return;
           const commit = () => {
             if (this.latestScene !== e.id) return;
@@ -713,6 +731,7 @@ export class ClientDirector {
           depart();
         };
         preload.onerror = () => {
+          this.transport?.report?.('image.error', { id: e.id, url: e.url, latestScene: this.latestScene });
           if (this.latestScene !== e.id) return;
           useStore.getState().set({ sceneTransition: null });
           this.transport?.send({ type: 'scene.presented', id: e.id, ok: false });
@@ -745,6 +764,7 @@ export class ClientDirector {
     const ttl = e.ttl_ms ?? 60000;
     const preload = new Image();
     preload.onload = () => {
+      this.transport?.report?.('image.loaded', { id: e.id, url: e.url, latestScene: this.latestScene });
       if (epoch !== this.epoch) return;
       const cur = useStore.getState();
       if (e.scene_key && e.scene_key !== cur.bgKey) return;

@@ -62,11 +62,11 @@ export class Story {
     this.revision++;
     return true;
   }
-  resolve(update: WorldUpdate, userText: string) {
+  resolve(update: WorldUpdate, userText: string, intent = 'unknown', intentConfidence = 0, miraReply = '') {
     // Only a model result tied to this exact utterance can establish a consequence.
     // Hypotheticals/questions and refusals are classified as none by the world prompt.
     if (
-      !isWorldAction(userText) ||
+      !isWorldAction(userText, intent, intentConfidence, miraReply) ||
       update.evidence !== userText ||
       typeof update.consequence !== 'string' ||
       !update.consequence.trim() ||
@@ -75,7 +75,8 @@ export class Story {
       (update.visual_prompt !== undefined && typeof update.visual_prompt !== 'string')
     )
       return false;
-    if (sceneDescription(update.scene_prompt) && !isTravelAction(userText)) return false;
+    if (sceneDescription(update.scene_prompt) && !isTravelAction(userText, intent, intentConfidence, miraReply))
+      return false;
     this.consequence = update.consequence.slice(0, 500);
     this.title = update.scene_prompt ? '准备出发' : '此刻的变化';
     this.history.push({ event: this.event || '自由交流', consequence: this.consequence, evidence: userText });
@@ -117,13 +118,20 @@ export class Story {
   }
 }
 
-// 门禁只做"否决"，意图判断交给 world 模型（consequence/evidence 锚定原话）。
+// 门禁只做"否决"，意图判断交给 JEV/world 模型（consequence/evidence 锚定原话）。
 // 窄白名单曾把自然说法挡在外面（"带我去你说的那个地方"不命中动词表就被丢成 none）。
-// “……的很好”这类评价/感叹不是意图；疑问、假设、拒绝、将来时同理否决
+// “……的很好”这类评价/感叹不是意图；疑问、假设、拒绝、将来时同理否决。
+// 同行邀请只有在 JEV 判为 action 且 Mira 的实际回复明确答应后才例外放行。
 const ACTION_VETO =
   /(如果|假如|假设|以后|改天|吗|么|为何|为什么|怎么|多少|哪[个里儿]|[？?]|不要|不想|不愿|别|不去|[得的](很|真|太|挺|好))/;
-export function isWorldAction(text: string) {
+const ACCEPTED_INVITATION =
+  /(走呗|走吧|去吧|出发吧|那就走|那走|一起走|一起去|跟你去|陪你去|我陪你|好[呀啊]?[,， ]*(我们|一起)?(走|去)|可以[,， ]*(一起)?(走|去))/;
+
+export function isWorldAction(text: string, intent = 'unknown', intentConfidence = 0, miraReply = '') {
+  const acceptedInvitation = isAcceptedInvitation(text, miraReply, intent, intentConfidence);
+  if (acceptedInvitation) return true;
   if (ACTION_VETO.test(text)) return false;
+  if (intent === 'action' && intentConfidence >= 0.8) return true;
   return (
     /^(好[的啊呀]?|行|可以|嗯|同意|随便|听你的)[，。！!\s]*$/.test(text.trim()) ||
     /(我们|咱们|一起|现在|我|你|帮我|让它|把|陪|带|想|要|试|看|听|点|写|拿|放|唱|哼|坐|递|端|捡|接|关|开|拍|摸|喂|去|走|来|回|逛)/.test(
@@ -132,11 +140,23 @@ export function isWorldAction(text: string) {
   );
 }
 
-export function isTravelAction(text: string) {
+export function isTravelAction(text: string, intent = 'unknown', intentConfidence = 0, miraReply = '') {
   return (
-    isWorldAction(text) &&
+    isWorldAction(text, intent, intentConfidence, miraReply) &&
     !/(回忆|想起|记得|上次|去年|小时候|照片里)/.test(text) &&
-    /(去|走|出门|出去|出发|到|回|离开|过来|陪你|带我|看看|走走|逛逛|散个步|溜达|启程|动身)/.test(text)
+    /(出门|出去|出发|离开|走到|走走|逛逛|散个步|溜达|启程|动身|前往|回到|回去|返回|一起走|跟我走|走吧|走呗|带我去|陪你去|去[^看拿取找递放收翻拍掉除过年]|到.{1,16}(坐坐|走走|逛逛))/.test(
+      text,
+    )
+  );
+}
+
+function isAcceptedInvitation(text: string, miraReply: string, intent: string, intentConfidence: number) {
+  return (
+    intent === 'action' &&
+    intentConfidence >= 0.8 &&
+    /(要不要|想不想|愿不愿|跟我|和我|陪我|一起)/.test(text) &&
+    !/(不一起|不去|不能去|不方便|你(先|自己|慢)走|还得|留在|留这)/.test(miraReply) &&
+    ACCEPTED_INVITATION.test(miraReply)
   );
 }
 

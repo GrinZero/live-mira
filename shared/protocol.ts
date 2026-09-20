@@ -72,6 +72,7 @@ export type ClientPhase = 'boot' | 'idle' | 'listening' | 'thinking' | 'speaking
 // ---------- 上行 client → server ----------
 export type UpMessage =
   | { type: 'hello'; session_id?: string; client?: string; client_token?: string; fresh_world?: boolean } // client_token：会话所有权凭据，reattach 需匹配
+  | { type: 'diagnostics.client'; name: string; data?: unknown }
   | { type: 'debug' } // 订阅服务端日志流（默认不广播；日志含对话内容）
   | { type: 'enter' } // 用户"轻触进入"：开场白
   | { type: 'mic'; muted: boolean }
@@ -92,7 +93,7 @@ export type UpMessage =
 
 // ---------- 下行 server → client ----------
 export type DownMessage =
-  | { type: 'session'; session_id: string; resumed: boolean }
+  | { type: 'session'; session_id: string; resumed: boolean; trace_id?: string }
   | { type: 'state'; phase: 'listening' | 'thinking' | 'speaking' | 'idle' }
   | { type: 'audio.begin'; response_id: string; sample_rate: number }
   | { type: 'audio.end'; response_id: string; interrupted?: boolean }

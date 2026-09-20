@@ -670,12 +670,13 @@ export function VrmActor({ actorRef }: { actorRef: React.MutableRefObject<Charac
   const gesture = useStore((s) => s.gesture);
   const phase = useStore((s) => s.phase);
   const bgKey = useStore((s) => s.bgKey);
+  const bgUrl = useStore((s) => s.bgUrl);
   const journey = useStore((s) => s.sceneTransition?.phase);
   useEffect(() => {
     impl.setJourney(journey ?? null);
     if (journey === 'departing' || journey === 'arriving') impl.clearGesture();
   }, [journey, impl]);
-  useEffect(() => impl.setSceneStanding(stagingFor(bgKey).standing), [bgKey, impl]);
+  useEffect(() => impl.setSceneStanding(stagingFor(bgKey, bgUrl).standing), [bgKey, bgUrl, impl]);
   useEffect(() => impl.setEmotion(emotion as Emotion), [emotion, impl]);
   useEffect(() => {
     if (motion) {
@@ -702,7 +703,7 @@ export function VrmActor({ actorRef }: { actorRef: React.MutableRefObject<Charac
     const state = useStore.getState(),
       group = placement.current;
     if (group) {
-      const st = stagingFor(state.bgKey);
+      const st = stagingFor(state.bgKey, state.bgUrl);
       group.rotation.y = 0;
       group.position.set(0, st.groundY, 0);
       if (shadow.current && shadowMat.current) {

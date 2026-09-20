@@ -1,6 +1,9 @@
+import { traceEvent } from './telemetry.js';
 import WebSocket from 'ws';
 import { config } from './config.js';
 import { log } from './log.js';
+import { stripStage } from '../../shared/spoken-text.js';
+export { stripStage } from '../../shared/spoken-text.js';
 import {
   gestureForLegacy,
   type Action,
@@ -222,19 +225,21 @@ export class DuplexClient {
     this.send({
       type: 'session.create',
       session,
-      // 判停平滑窗：默认 1500ms 会把句间停顿切成新回合；放宽后用户能一口气说几件事
-      ...(config.vadSmoothMs
-        ? {
-            extension: {
+      extension: {
+        // Filter narration before synthesis upstream; never buffer a whole reply locally.
+        // Doubao Duplex API recommends 0–100. Longer parentheticals can still be spoken.
+        tts: { extra: { max_length_to_filter_parenthesis: 100 } },
+        ...(config.vadSmoothMs
+          ? {
               asr: {
                 extra: {
                   end_smooth_window_ms: config.vadSmoothMs,
                   enable_custom_vad: true,
                 },
               },
-            },
-          }
-        : {}),
+            }
+          : {}),
+      },
     });
     this.startPacer();
     log('duplex', 'session.create sent', {
@@ -358,6 +363,8 @@ export class DuplexClient {
   }
 
   send(obj: unknown) {
+    if ((obj as { type?: string })?.type !== 'input_audio_buffer.append')
+      traceEvent('duplex.send', { message: obj, delivered: this.ws?.readyState === WebSocket.OPEN });
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj));
   }
 
@@ -395,9 +402,6 @@ export class DuplexClient {
 }
 
 // speech_text_buffer 是口播文本：剥掉括号/书名号包裹的舞台提示，避免被念出来
-export function stripStage(text: string): string {
-  return text.replace(/（[^（）]*）|\([^()]*\)|【[^【】]*】/g, '').trim();
-}
 
 // 宽容解析：模型偶尔写枚举外的中文描述，按关键词归一到最近枚举
 const KW = {

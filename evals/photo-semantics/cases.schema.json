@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:mira:photo-semantics:cases:v1",
+  "type": "object",
+  "required": ["$schema", "schemaVersion", "datasetId", "datasetVersion", "provenance", "evaluation", "cases"],
+  "properties": {
+    "$schema": { "const": "./cases.schema.json" },
+    "schemaVersion": { "const": "1.0.0" },
+    "datasetId": { "const": "mira-photo-semantics-regression-v1" },
+    "datasetVersion": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$" },
+    "provenance": {
+      "type": "object",
+      "required": ["kind", "statement", "containsPrivateSourceMaterial"],
+      "properties": {
+        "kind": { "const": "synthetic" },
+        "statement": { "type": "string", "minLength": 30 },
+        "containsPrivateSourceMaterial": { "const": false }
+      },
+      "additionalProperties": false
+    },
+    "evaluation": {
+      "type": "object",
+      "required": ["mode", "confidenceThreshold", "minimumCasePassRate", "registeredScorers"],
+      "properties": {
+        "mode": { "const": "provider_required" },
+        "confidenceThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "minimumCasePassRate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "registeredScorers": { "type": "array", "minItems": 2, "uniqueItems": true }
+      },
+      "additionalProperties": false
+    },
+    "cases": { "type": "array", "minItems": 8, "maxItems": 25 }
+  },
+  "additionalProperties": false
+}

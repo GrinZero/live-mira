@@ -1,3 +1,4 @@
+import { traceEvent } from './telemetry.js';
 import type { LogEntry } from '../../shared/protocol.js';
 
 const BUF_MAX = 800;
@@ -5,6 +6,7 @@ const buf: LogEntry[] = [];
 const subs = new Set<(e: LogEntry) => void>();
 
 export function log(cat: LogEntry['cat'], msg: string, data?: unknown) {
+  traceEvent(`log.${cat}`, { msg, data });
   const e: LogEntry = { ts: Date.now(), cat, msg, data };
   buf.push(e);
   if (buf.length > BUF_MAX) buf.shift();

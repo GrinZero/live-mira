@@ -10,6 +10,7 @@ const cases = [
   { text: '先别说话，陪我看会儿雨。', expected: 'quiet' },
   { text: '这里真安静，你平时也常来吗？', expected: 'question' },
   { text: '那我们现在出去走走吧。', expected: 'action' },
+  { text: '要不要跟我去桥边走呗？', expected: 'action' },
   { text: '我今天路过桥边，想起小时候放学的路。', expected: 'sharing' },
 ];
 for (const c of cases) {

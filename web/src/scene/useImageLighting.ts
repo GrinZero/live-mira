@@ -26,12 +26,12 @@ const LIGHTING = `
     + miraImageUp * imageWeights.z + miraImageDown * imageWeights.w;
   float imageLuma = dot(imageLight, vec3(0.2126, 0.7152, 0.0722));
   vec3 imageTint = clamp(imageLight / max(imageLuma, 0.025), vec3(0.55), vec3(1.6));
-  // Preserve albedo and the existing toon shading; limit exposure adaptation.
-  float imageExposure = mix(0.78, 1.10, smoothstep(0.025, 0.5, imageLuma));
-  col *= mix(vec3(1.0), mix(vec3(1.0), imageTint, 0.22) * imageExposure, miraImageStrength);
-  float imageEdge = pow(1.0 - clamp(abs(dot(imageNormal, normalize(vViewPosition))), 0.0, 1.0), 4.0);
-  // At most 2.5% linear-light wrap. Dark surroundings cannot create a halo.
-  col += imageLight * imageEdge * (0.025 * miraImageStrength);
+  // Restrict the environmental tint to grazing silhouette normals. Front-facing
+  // skin and clothing retain their original color and exposure, exactly.
+  float imageFacing = abs(dot(imageNormal, normalize(vViewPosition)));
+  float imageEdge = 1.0 - smoothstep(0.02, 0.22, imageFacing);
+  col *= mix(vec3(1.0), imageTint, 0.12 * imageEdge * miraImageStrength);
+  col += min(imageLight, vec3(0.5)) * imageEdge * (0.018 * miraImageStrength);
 #endif
 `;
 const GRID = 64;
@@ -122,7 +122,7 @@ export function useImageLighting(vrm: VRM) {
         Object.assign(shader.uniforms, state.uniforms);
         shader.fragmentShader = DECLARATIONS + shader.fragmentShader.replace(ANCHOR, LIGHTING + '\n' + ANCHOR);
       };
-      material.customProgramCacheKey = () => cacheKey.call(material) + ':mira-image-lighting-v1';
+      material.customProgramCacheKey = () => cacheKey.call(material) + ':mira-image-lighting-rim-v2';
       material.needsUpdate = true;
       return () => {
         state.materials.delete(material as THREE.ShaderMaterial);

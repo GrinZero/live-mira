@@ -1,3 +1,4 @@
+import { exportTrace, listTraces } from './telemetry.js';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -9,6 +10,8 @@ import { authEnabled, isAuthed, validToken, authCookie, authThrottled, RateLimit
 import { safeJoin, sendFile, sendJson } from './http-static.js';
 import type { UpMessage } from '../../shared/protocol.js';
 import { worldStore } from './world/runtime.js';
+import { jevDecide } from './decisions.js';
+import { TypeSafePhotoJudge } from './semantic/photo.js';
 
 // HTTP：静态（web/dist）+ /assets + /media + /api/* ；WS：/ws
 function readBody(req: http.IncomingMessage, limit = 4096): Promise<string> {
@@ -85,6 +88,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse) {
     }
     res.setHeader('Cache-Control', 'no-store');
     return sendJson(res, 200, { exists: worldStore().hasStory(token) });
+  }
+
+  if ((p === '/api/diagnostics' || p.startsWith('/api/diagnostics/')) && req.method === 'GET') {
+    const token = req.headers['x-mira-client-token'];
+    if (typeof token !== 'string' || token.length < 16 || token.length > 256)
+      return sendJson(res, 401, { error: 'missing_owner_token' });
+    res.setHeader('Cache-Control', 'no-store');
+    await getOwnedSession(token)?.trace.flush();
+    if (p === '/api/diagnostics') return sendJson(res, 200, await listTraces(token));
+    const traceId = p.slice('/api/diagnostics/'.length);
+    const result = await exportTrace(token, traceId);
+    if (!result) return sendJson(res, 404, { error: 'not_found' });
+    res.setHeader('Content-Disposition', `attachment; filename="mira-session-${traceId}.otlp.json"`);
+    return sendJson(res, 200, result);
   }
 
   if (p === '/api/logs') {
@@ -215,7 +232,10 @@ wss.on('connection', (ws, req) => {
         ws.close();
         return;
       }
-      session = new ClientSession(tag);
+      session = new ClientSession(tag, {
+        decide: config.jevEnabled ? jevDecide : null,
+        photoJudge: config.jevEnabled ? new TypeSafePhotoJudge(jevDecide) : null,
+      });
       connToken = msg.client_token ?? '';
       if (msg.fresh_world && prev?.owns(msg.client_token)) await prev.destroy();
       await session.start(ws, msg, msg.fresh_world === true);
@@ -227,7 +247,10 @@ wss.on('connection', (ws, req) => {
       const old = session;
       resetting = (async () => {
         await old.destroy().catch((e) => log('session', `reset destroy fail: ${(e as Error).message}`));
-        const fresh = new ClientSession(tag);
+        const fresh = new ClientSession(tag, {
+          decide: config.jevEnabled ? jevDecide : null,
+          photoJudge: config.jevEnabled ? new TypeSafePhotoJudge(jevDecide) : null,
+        });
         session = fresh;
         await fresh
           .start(ws, { client_token: connToken }, true)

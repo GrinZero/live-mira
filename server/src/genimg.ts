@@ -1,3 +1,5 @@
+import { traceOperation, traceEvent } from './telemetry.js';
+import { sceneSpacePrompt } from '../../shared/scene-space.js';
 import { sceneGuide, GUIDE_INSTRUCTION } from './scene-guide.js';
 import {
   sceneLayoutPrompt,
@@ -129,7 +131,7 @@ export function buildMediaPrompt(
   if (kind === 'overlay') {
     return `编辑当前底图，只添加事件：${body}。保留参考图原有风格、镜头、空间布局、地面和人物站位，不转换成插画，不重新设计场景。新元素遵循原图材质和光照。无额外文字无UI。`;
   }
-  return buildPrompt(style, bodies, theme) + sceneLayoutPrompt(opts.layout);
+  return buildPrompt(style, bodies, theme) + sceneLayoutPrompt(opts.layout) + sceneSpacePrompt(body, opts.layout);
 }
 
 const newId = () => `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
@@ -211,7 +213,7 @@ export function createGenImg(deps: GenImgDeps) {
     let refBuf: Buffer | undefined;
     let prompt = buildMediaPrompt(kind, styleTemplate, sceneBodies, theme, opts);
     if (kind === 'scene') {
-      refImage = `data:image/png;base64,${(await sceneGuide(opts.layout)).toString('base64')}`;
+      refImage = `data:image/png;base64,${(await sceneGuide(opts.layout, undefined, sceneBodies[theme] ?? theme)).toString('base64')}`;
       prompt = GUIDE_INSTRUCTION + prompt;
     }
     if (opts.overlay) {
@@ -250,7 +252,8 @@ export function createGenImg(deps: GenImgDeps) {
           // The layout pass may retain guide marks. Clean them in a separate edit
           // before caching or publishing; never expose the layout draft.
           raw = await attempt(
-            '精确清理这张环境图：移除所有紫红色矩形框、青色或蓝绿色椭圆标记、构图网格和辅助线，用周围相同的地面或背景无缝补全。保持所有建筑、镜头、透视、画幅、地面位置、材质和光照不变。不要添加人物或人体局部，不要重新构图。只输出清理后的同一张环境图。',
+            sceneSpacePrompt(sceneBodies[theme] ?? theme, opts.layout) +
+              '精确清理这张环境图：若草图包含橙色顶板、绿色地板，必须转化为真实屋顶和干燥廊下地面，不能删掉对应建筑结构。移除所有紫红色矩形框、青色或蓝绿色椭圆标记、构图网格和辅助线，用周围相同的地面或背景无缝补全。保持所有建筑、镜头、透视、画幅、地面位置、材质和光照不变。不要添加人物或人体局部，不要重新构图。只输出清理后的同一张环境图。',
             `data:image/jpeg;base64,${(await toJpeg(raw)).toString('base64')}`,
             false,
             true,
@@ -268,6 +271,8 @@ export function createGenImg(deps: GenImgDeps) {
           if (kind !== 'overlay') onDegrade('bad', kind);
           return;
         }
+        // AI placement review is disabled: do not block travel or regenerate
+        // the scene based on a model verdict. Basic image QC above still applies.
         const jpg = await toJpeg(
           kind === 'scene' ? await sharp(raw).resize(2560, 1440, { fit: 'cover' }).toBuffer() : raw,
         );
@@ -329,7 +334,7 @@ export function createGenImg(deps: GenImgDeps) {
       const baseKey = `${kind}_${sceneKey}_${crypto
         .createHash('md5')
         .update(
-          'cinematic-scene-only-v8' +
+          'cinematic-spatial-background-v10-geometry-checked' +
             buildMediaPrompt(kind, styleTemplate, sceneBodies, theme, opts) +
             (opts.caption ?? '') +
             (opts.overlay?.url ?? opts.overlay?.file ?? opts.overlay?.base ?? ''),
@@ -339,7 +344,9 @@ export function createGenImg(deps: GenImgDeps) {
       let key = baseKey;
       if (kind === 'scene') {
         const prefix = `${baseKey}_stage3_`;
-        const cached = fs.readdirSync(dir).find((name) => name.startsWith(prefix) && name.endsWith('.jpg'));
+        const cached = fs
+          .readdirSync(dir)
+          .find((name) => name.startsWith(prefix) && /_stage3_\d{3}_\d{3}\.jpg$/.test(name));
         const layoutKey = path.join(dir, baseKey);
         const layout =
           (cached && layoutFromUrl(`/${cached}`)) ||
@@ -354,6 +361,7 @@ export function createGenImg(deps: GenImgDeps) {
 
       const prev = inflight.get(key);
       if (prev) {
+        traceEvent('media.join_inflight', { kind, key, contextId: opts.contextId });
         if (opts.silent) return;
         const id = newId();
         const evt = (status: MediaEvent['status'], extra: Partial<MediaEvent> = {}) =>
@@ -386,7 +394,7 @@ export function createGenImg(deps: GenImgDeps) {
         return;
       }
 
-      const p = run(kind, theme, opts, key);
+      const p = traceOperation('media.generate', { kind, theme, opts, key }, () => run(kind, theme, opts, key));
       inflight.set(key, p);
       void p.finally(() => {
         if (inflight.get(key) === p) inflight.delete(key);

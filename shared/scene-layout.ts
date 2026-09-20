@@ -2,6 +2,25 @@
 export const SCENE_LAYOUT = { width: 2560, height: 1440, x: 0.4, footY: 0.8, actorHeight: 0.6 };
 export type SceneLayout = typeof SCENE_LAYOUT;
 
+// Reviewed calibration for the persisted cafe-photo scene. Its generated guide
+// (304, 830) lands on the table, so it must not override this asset-specific fix.
+const CAFE_PHOTO_LAYOUT: SceneLayout = { ...SCENE_LAYOUT, x: 0.69, footY: 0.87, actorHeight: 0.64 };
+const CAFE_PHOTO_ASSETS = [
+  '4e03031463d164b2fb5da70f7e1fb0bd4894e244b744d520af71fe2ad11db7b7.jpg',
+  'scene_69187971_5f40890616_stage3_304_830.jpg',
+];
+
+export function isCafeMatte(url: string): boolean {
+  const file = url.split(/[?#]/)[0].split('/').pop();
+  return (
+    file === 'cafe_interior.jpg' || file === '8920a2e85a323e979948ea2aa36d6c0f8bcdd66f894b4e457d4975caf2818768.jpg'
+  );
+}
+
+export function isCafeEnvironment(url: string): boolean {
+  return isCafeMatte(url) || CAFE_PHOTO_ASSETS.includes(url.split(/[?#]/)[0].split('/').pop() ?? '');
+}
+
 export function randomSceneLayout(random = Math.random): SceneLayout {
   return {
     ...SCENE_LAYOUT,
@@ -15,6 +34,7 @@ export function layoutToken(s: SceneLayout): string {
 }
 
 export function layoutFromUrl(url: string): SceneLayout | null {
+  if (CAFE_PHOTO_ASSETS.includes(url.split(/[?#]/)[0].split('/').pop() ?? '')) return { ...CAFE_PHOTO_LAYOUT };
   const match = url.match(/(?:_|[?&]layout=)stage3_(\d{3})_(\d{3})(?:_|[.&]|$)/);
   if (!match) return null;
   const x = Number(match[1]) / 1000,
@@ -31,7 +51,8 @@ export function sceneFrame(width: number, height: number, layout?: SceneLayout |
   const w = s.width * scale;
   const h = s.height * scale;
   // A full-body safety envelope (including relaxed arms) in viewport pixels.
-  const halfActorWidth = Math.min(0.45, (height * 0.6 * 0.22) / width + 0.04);
+  const actorHeight = (h * s.actorHeight) / height;
+  const halfActorWidth = Math.min(0.45, (height * actorHeight * 0.22) / width + 0.04);
   const screenX = layout ? Math.max(halfActorWidth, Math.min(1 - halfActorWidth, s.x)) : 0.35;
   const left = Math.max(width - w, Math.min(0, width * screenX - w * s.x));
   const top = Math.max(height - h, Math.min(0, height * (layout ? s.footY : 0.82) - h * s.footY));
@@ -42,7 +63,29 @@ export function sceneFrame(width: number, height: number, layout?: SceneLayout |
     top,
     actorX: (left + w * s.x) / width,
     footY: (top + h * s.footY) / height,
-    actorHeight: layout ? s.actorHeight : (h * s.actorHeight) / height,
+    actorHeight,
+  };
+}
+
+// Close companion framing. Zoom the photograph and actor together so doors and
+// furniture keep the same scale; the calibrated ground lies below the crop.
+export function companionFrame(width: number, height: number, layout?: SceneLayout | null) {
+  const s = layout ?? SCENE_LAYOUT;
+  const scale = Math.max(width / s.width, height / s.height, (height * 1.65) / (s.height * s.actorHeight));
+  const w = s.width * scale,
+    h = s.height * scale;
+  const actorHeight = (h * s.actorHeight) / height;
+  const screenX = width / height < 0.9 ? 0.5 : 0.42;
+  const left = Math.max(width - w, Math.min(0, width * screenX - w * s.x));
+  const top = Math.max(height - h, Math.min(0, height * 0.04 - h * (s.footY - s.actorHeight)));
+  return {
+    width: w,
+    height: h,
+    left,
+    top,
+    actorX: (left + w * s.x) / width,
+    footY: (top + h * s.footY) / height,
+    actorHeight,
   };
 }
 

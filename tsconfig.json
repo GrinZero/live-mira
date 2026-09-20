@@ -11,5 +11,5 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "noEmit": true
   },
-  "include": ["server/**/*.ts", "shared/**/*.ts", "scripts/**/*.ts", "scripts/**/*.mts"]
+  "include": ["server/**/*.ts", "shared/**/*.ts", "scripts/**/*.ts", "scripts/**/*.mts", "evals/**/*.ts"]
 }

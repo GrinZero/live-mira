@@ -22,8 +22,11 @@
     "format:check": "prettier --check .",
     "check": "pnpm run typecheck && pnpm run lint && pnpm run format:check",
     "test:e2e": "tsx scripts/test-client.ts",
-    "test": "tsx --test scripts/companion.test.ts scripts/security.test.ts scripts/world.test.ts scripts/genimg.test.ts scripts/decisions.test.ts",
+    "test": "tsx --test scripts/telemetry.test.ts scripts/companion.test.ts scripts/security.test.ts scripts/world.test.ts scripts/genimg.test.ts scripts/scene-space.test.ts scripts/scene-placement.test.ts scripts/decisions.test.ts scripts/speech-gate.test.ts",
     "test:jev": "tsx scripts/verify-jev-live.ts",
+    "eval:photo": "pnpm run evals:photo:live",
+    "evals:photo:validate": "tsx evals/photo-semantics/validate.ts",
+    "evals:photo:live": "tsx evals/photo-semantics/run-live.ts",
     "test:conversation": "tsx scripts/verify-companion-live.ts"
   },
   "dependencies": {

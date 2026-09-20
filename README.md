@@ -81,6 +81,7 @@ Node 服务端 —— 导演 agent，管"演什么"
 
 - **语音回合**：浏览器 PCM16k 单声道 20ms 帧 → 服务端 → Duplex。服务端 VAD 产出用户转写流（字幕）、角色音频流与文本流（同步字幕）。
 - **文字回合**：文字 → 导演生成 Mira 回应 → `speech_text_buffer.commit` 念出。协议没有 `response.create`，递词走诚实通道，不伪造麦克风输入；字幕由服务端直发。
+- **流式与动作旁白**：原生 PCM 到达即转发，不再等待整轮文本/音频完成。通过 [豆包全双工 API](https://docs.volcengine.com/docs/DoubaoVoice/endtoend-realtime-voice-full-duplex-version?lang=zh) 的 `extension.tts.extra.max_length_to_filter_parenthesis: 100` 在合成端过滤括号内容；本地 SpeechGate 只增量过滤字幕。超过 100 字的括号内容可能仍被朗读，提示词继续要求动作走工具。整轮只有括号动作时，本地补齐空回复结束，避免上游缺少 audio.done 导致卡住。
 - **多轮**：会话内保留最近对话、用户原话事实、Mira 已说经历、未回应话语与已确认事件后果；中断的回答不视为完整告知。
 
 打断选择**自动 VAD（双源）+ 手动按钮**，不用按住说话：
@@ -138,12 +139,14 @@ Node 服务端 —— 导演 agent，管"演什么"
 ## 验证
 
 ```bash
-pnpm test            # 离线回归：记忆、过期决策、开放世界、打断、静音、安全边界（当前 98 项）
+pnpm test            # 离线回归：记忆、过期决策、开放世界、打断、静音、安全边界
 pnpm check           # typecheck + lint + format:check
 pnpm build           # 前端类型检查及生产构建
 pnpm test:e2e        # 本地 WS 客户端端到端回归
 pnpm test:conversation                       # 真实服务多轮姓名/纠正/话题连贯性
 pnpm test:jev                                # 可选 TypeSafe AI 现场反应探测
+pnpm evals:photo:validate                    # 照片语义数据集离线契约校验
+pnpm evals:photo:live -- --out tmp/evals/photo-semantics/latest.json # 真实 TypeSafe 照片语义 eval
 pnpm exec tsx scripts/verify-voice-live.ts   # 合成输入 → 真实 ASR/语音/打断恢复
 pnpm exec tsx scripts/verify-world-live.ts   # 真实模型的事件及自由行动决策
 pnpm exec tsx scripts/verify-world-browser.ts # 隔离存档 + 真实浏览器往返/取消/重启恢复（语音使用 fixture）
@@ -162,7 +165,7 @@ pnpm exec tsx scripts/verify-media-live.ts   # 真实生图和转场链路（调
 - 开放剧情不保证所有长对话无矛盾（有事实记录、过期校验、明确行动检查兜底）。
 - 持久恢复依赖同一浏览器的访问凭证和服务端持久盘；清除浏览器数据后暂无账号找回入口。旧相遇会保留，但尚无历史存档选择界面。
 - 当前角色动作是程序化 fallback，不是经过动捕清理的 VRMA/Mixamo 成品；生成式图片是 2D 场景板，尚不是可自由走动的完整 3D 空间。
-- 可选的 Jev 置信度阈值仍是保守初值，尚未做大样本校准；没有配置 `TYPESAFE_API_KEY` 时自动跳过该层。
+- 可选的 Jev 置信度阈值仍是保守初值，尚未做大样本校准；运行时没有配置 `TYPESAFE_API_KEY` 时自动跳过该层，provider-backed eval 则会明确要求该 key。
 
 ## 上线部署
 
@@ -183,7 +186,7 @@ pnpm exec tsx scripts/verify-media-live.ts   # 真实生图和转场链路（调
 - 首次 Git 提交 `ecb9be0`：`2026-09-18 14:50:32`（Asia/Shanghai）。
 - 上述两个锚点之间的日历跨度：`62 小时 23 分 47 秒`。其中包含 session 重载、等待、人工反馈和空闲时间，不能表述成 62 小时连续开发。
 - 首版实验的原始计划仍是 `72 小时`，对应 `PLAN.md` 的实验预算；它是计划上限，不是实际工时证明。
-- 人类/团队实际有效工时：`[待填写：需要根据你的时间记录确认；仅凭 Devin/Codex session 无法严谨推算]`。
+- 人类/团队实际有效工时：<72h。
 - 首版提交之后，`2026-09-18` 至 `2026-09-19` 的历史 session 继续补做部署尝试、工程复核、真实浏览器路线、世界存档和展示录制；这些是后续迭代，不计入“首版 72 小时计划”的实际有效工时。
 
 之后如果继续开发，下面的“两周”是未来 `14 个日历日` 的演进计划，不是已经投入的时间；完整分工和人工纠偏见 `AI_USAGE.md`。
@@ -195,6 +198,7 @@ pnpm exec tsx scripts/verify-media-live.ts   # 真实生图和转场链路（调
 - **语音**：回声/噪声真机矩阵测试；附和与真打断的细分策略；首包延迟与关键阶段耗时观测页。
 - **会话**：录制回放导出为可分享链接；在已有世界存档之上完善长期用户事实库和存档选择，真正存储起来。
 - **工程**：模型/媒体 provider 可替换抽象收拢（目前已走 env 可换）；会话回放诊断页；更多端到端自动化测试。
+- **评估**：需建立分层和分步评估体系，对 LLM 调用进行处理
 - **场景**：探索接入 fal 的 Minimax H3 实时互动，将彻底改写架构。
 
 ## 地图与世界存档
@@ -202,3 +206,15 @@ pnpm exec tsx scripts/verify-media-live.ts   # 真实生图和转场链路（调
 进入后打开「足迹」：画布只显示实际到过的地点，可拖动、缩放和选择返回。新地点的地图插画后台生成，失败时用原场景照片占位，不阻塞往返。`MAP_IMAGES=0` 可关闭地图生图调用。当前采用固定坐标的独立区域拼接，尚未实现整张地图的无缝局部重绘。
 
 切换先准备图片，再提交抵达；取消、超时或失败保持原地点。回访读取原背景、前景和环境状态，不重新生成地点。刷新或重启恢复已提交的地点，不恢复半途动作。重新开始创建新世界并保留旧存档。详见 [实现记录](docs/world-implementation.md)。
+
+### Session 诊断导出
+
+页面右上角 **导出诊断** → 选择当前或历史 session → **下载 OTLP JSON**。无需开启 debug 或 `RECORD=1`。从本功能启用后创建的 session 开始常驻记录；不能补回此前未记录的过程。断线重连复用同一 trace，重来创建新 trace，历史记录仍可在原浏览器选择。
+
+导出文件采用 OpenTelemetry 的 [OTLP JSON traces 格式](https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding)，含 `resourceSpans`、十六进制 trace/span ID、父子关系、纳秒时间戳和状态。实现为本地诊断 journal/exporter，不依赖 OTel SDK，也不自动上传到远端。可直接分析 JSON，或 POST 到 Collector 的 OTLP HTTP `/v1/traces`（`Content-Type: application/json`）。
+
+记录内容：用户输入/ASR、原始 Duplex 文本与工具事件、导演/语义判断的完整输入输出、世界更新接受/拦截原因、过期回合、生成提示词/重试/质检/缓存、媒体下发、浏览器收包/图片加载/转场状态和 ACK。每条 span 的 `mira.data` 属性是 JSON 文本；请求中的 `inProgress: true` 表示导出时尚未结束，错误 span 的 status.code 为 2。通过 context_id、media id、response_id 和父 span 关联异步步骤。`browser.state` 的 bgUrl/sceneTransition 表示客户端状态更新，不等于物理屏幕显示证明。
+
+服务器按所有权令牌的 SHA-256 目录保存到 `recordings/traces/`，不受全局日志 800 条上限影响，重启后仍可读取。当前导出是进行中会话的快照。记录保留完整对话和提示词，但脱敏密钥/所有权令牌/媒体访问参数，省略原始音频与图片二进制（下载结果保存字节数及 SHA-256）。浏览器记录通过 WS 回传，断网期间无法送达的浏览器事件不在服务器记录内。现阶段不自动清理历史目录，需要时手动归档；浏览器清空 mira.ct 后不能再通过页面访问旧令牌的记录。
+
+接口（同时遵循已有站点认证）：`GET /api/diagnostics` 列出本浏览器会话；`GET /api/diagnostics/<traceId>` 导出。两者均需 `x-mira-client-token` 请求头，值为该浏览器的 mira.ct；仅知道 traceId 无权读取。写盘失败时当前导出返回错误，不会把不完整记录声称为完整成功。

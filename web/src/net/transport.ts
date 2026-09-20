@@ -1,3 +1,4 @@
+import { rememberTrace } from './diagnostics';
 import type { DownMessage, UpMessage } from '../../../shared/protocol';
 
 // 传输层抽象：真实 WS 或 MockTransport（录制回放）实现同一接口
@@ -6,6 +7,7 @@ export interface Transport {
   send(msg: UpMessage): void;
   sendAudio(pcm: ArrayBuffer): void;
   close(): void;
+  report?(name: string, data: unknown): void;
   onMessage: (msg: DownMessage) => void;
   onAudio: (pcm: ArrayBuffer) => void;
   onClose?: () => void;
@@ -42,9 +44,17 @@ export class RealTransport implements Transport {
       ws.onmessage = (ev) => {
         if (typeof ev.data === 'string') {
           try {
-            this.onMessage(JSON.parse(ev.data) as DownMessage);
-          } catch {
-            /* noop */
+            const msg = JSON.parse(ev.data) as DownMessage;
+            if (msg.type === 'session' && msg.trace_id) rememberTrace(msg.trace_id);
+            if (msg.type !== 'log' && msg.type !== 'pong')
+              this.send({
+                type: 'diagnostics.client',
+                name: 'received',
+                data: { type: msg.type, ...(msg.type === 'media.event' ? { event: msg.event } : {}) },
+              });
+            this.onMessage(msg);
+          } catch (error) {
+            this.report('handler.error', { message: String(error) });
           }
         } else {
           this.onAudio(ev.data as ArrayBuffer);
@@ -57,6 +67,9 @@ export class RealTransport implements Transport {
     });
   }
 
+  report(name: string, data: unknown) {
+    this.send({ type: 'diagnostics.client', name, data });
+  }
   send(msg: UpMessage) {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
   }

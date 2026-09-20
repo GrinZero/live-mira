@@ -10,6 +10,14 @@ import { ClientSession } from '../server/src/session.js';
 
 // 安全回归：路径边界、流错误、限流器有界性、会话所有权、detach 身份校验
 
+async function waitFor(condition: () => boolean, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`condition not met within ${timeoutMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 test('safeJoin rejects same-prefix sibling directories (media_evil escape)', () => {
   const root = path.join(os.tmpdir(), 'media');
   assert.equal(safeJoin(root, 'a.jpg'), path.join(root, 'a.jpg'));
@@ -34,7 +42,7 @@ test('sendFile answers 404 instead of crashing when the stream fails to open', a
     destroy() {},
   };
   sendFile(res as unknown as http.ServerResponse, missing);
-  await new Promise((r) => setTimeout(r, 50));
+  await waitFor(() => res.code === 404);
   assert.equal(res.code, 404);
 });
 

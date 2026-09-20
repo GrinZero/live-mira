@@ -1,4 +1,4 @@
-import { isStagedScene, sceneFrame, layoutFromUrl } from '../../../shared/scene-layout';
+import { isCafeMatte, isStagedScene, companionFrame, layoutFromUrl } from '../../../shared/scene-layout';
 import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../state/store';
 import { eyeContact } from '../vision/eyeContact';
@@ -22,7 +22,7 @@ export function Background() {
   const fx = useStore((s) => s.fx);
   const url = useStore((s) => s.bgUrl);
   const bgKey = useStore((s) => s.bgKey);
-  const cafe = bgKey === 'cafe_interior';
+  const cafe = isCafeMatte(url);
   const overlay = useStore((s) => s.overlay);
   // shown = 正在显示（含淡出中）的叠层；store 清掉或到期时先淡出再卸载
   const [shown, setShown] = useState<{ url: string; out: boolean } | null>(null);
@@ -97,7 +97,7 @@ export function Background() {
   const scale = Math.max(size.width / natural.width, size.height / natural.height);
   const w = natural.width * scale,
     h = natural.height * scale;
-  const frame = sceneFrame(size.width, size.height, layoutFromUrl(url));
+  const frame = companionFrame(size.width, size.height, layoutFromUrl(url));
   const style = isStagedScene(url)
     ? { width: frame.width, height: frame.height, left: frame.left, top: frame.top }
     : { width: w, height: h, left: (size.width - w) / 2, top: (size.height - h) / 2 };

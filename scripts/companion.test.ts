@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Director, parseDecision, spokenLine, type DirectorHooks } from '../server/src/director.js';
+import { legacyPhotoDisplayRejected as photoDisplayRejected } from '../server/src/compat/legacy-photo.js';
+import { ClientSession } from '../server/src/session.js';
 import { Story } from '../server/src/story.js';
 import { loadContent } from '../server/src/content.js';
 import { ClientDirector } from '../web/src/state/directorClient.js';
@@ -8,7 +10,18 @@ import { useStore } from '../web/src/state/store.js';
 import { SCENE_ARRIVE_MS, SCENE_DEPART_MS } from '../web/src/state/sceneTransition.js';
 import type { DownMessage, UpMessage } from '../shared/protocol.js';
 
-function harness(chat: ConstructorParameters<typeof Director>[2] = async () => '{"reply":"好，我记住了。"}') {
+async function waitFor(condition: () => boolean, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`condition not met within ${timeoutMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function harness(
+  chat: ConstructorParameters<typeof Director>[2] = async () => '{"reply":"好，我记住了。"}',
+  decide: ConstructorParameters<typeof Director>[3] = null,
+) {
   const spoken: string[] = [],
     media: unknown[] = [],
     contexts: string[] = [],
@@ -23,7 +36,7 @@ function harness(chat: ConstructorParameters<typeof Director>[2] = async () => '
     story: () => {},
     available: () => true,
   };
-  return { d: new Director(loadContent(), hooks, chat), spoken, media, contexts, narrations };
+  return { d: new Director(loadContent(), hooks, chat, decide), spoken, media, contexts, narrations };
 }
 
 test('world is generated, choices are optional, results require the exact current utterance', () => {
@@ -295,6 +308,44 @@ test('playback, not server generation state, owns speaking; stale audio end is i
   assert.deepEqual(sent.at(-1), { type: 'playback', response_id: 'new', remaining_ms: 0 });
 });
 
+test('a held response is not released when the user is already speaking', async () => {
+  const session = new ClientSession('interrupt-regression');
+  const sent: string[] = [];
+  const s = session as unknown as {
+    ws: { readyState: number; bufferedAmount: number; send: (payload: string | Buffer) => void };
+    userSpeaking: boolean;
+    dropAudio: boolean;
+    curResponseId: string;
+    pending: { rid: string; pcm: Buffer[]; text: string[]; timer: NodeJS.Timeout };
+    onDuplexEvent: (event: Record<string, unknown>) => void;
+  };
+  s.ws = {
+    readyState: 1,
+    bufferedAmount: 0,
+    send: (payload) => sent.push(typeof payload === 'string' ? payload : payload.toString('base64')),
+  };
+  s.userSpeaking = true;
+  s.dropAudio = true;
+  s.curResponseId = 'held-response';
+  s.pending = {
+    rid: 'held-response',
+    pcm: [Buffer.from('late-audio')],
+    text: ['late text'],
+    timer: setTimeout(() => {}, 60_000),
+  };
+
+  s.onDuplexEvent({ type: 'response.output_audio.done', response_id: 'held-response' });
+
+  assert.ok(s.pending, 'the held response must remain gated until the interruption decision settles');
+  assert.equal(
+    sent.some((payload) => payload.includes('audio.begin')),
+    false,
+    'audio must not begin while user speech is active',
+  );
+  clearTimeout(s.pending.timer);
+  await session.destroy();
+});
+
 test('bare PCM outside the audio.begin→end window is never played', () => {
   const client = new ClientDirector(false);
   const played: ArrayBuffer[] = [];
@@ -349,6 +400,29 @@ test('verbal agreement without a world update is reconciled for explicit departu
         }),
   );
   await d.handleTextTurn('我们现在推门出去吧。');
+  assert.equal(media.length, 1);
+  assert.equal((media[0] as any[])[0], 'scene');
+});
+
+test('an accepted colloquial invitation commits the requested departure', async () => {
+  const text = '要不要跟我去桥边走呗？';
+  const { d, media } = harness(
+    async (opts) =>
+      opts.system.includes('这是文字对话')
+        ? JSON.stringify({ reply: '走呗。', world: null })
+        : JSON.stringify({
+            action: 'resolve',
+            evidence: text,
+            consequence: '你们一起往桥边走去。',
+            scene_prompt: '雨后的桥边',
+          }),
+    async () => ({
+      intent: { choice: 'action', confidence: 0.99 },
+      quiet: { choice: 'keep', confidence: 0.99 },
+      reaction: { choice: 'none', confidence: 0.99 },
+    }),
+  );
+  await d.handleTextTurn(text);
   assert.equal(media.length, 1);
   assert.equal((media[0] as any[])[0], 'scene');
 });
@@ -416,6 +490,103 @@ test('a just-dispatched show_photo call blocks the speech fallback from stacking
   d.armPhotoFromSpeech('喏，这张给你看。');
   assert.equal(d.photoArmed, false);
   assert.equal(d.consumeArmedPhoto(), null);
+});
+
+test('a refusal in the final photo reply suppresses the staged image', async () => {
+  assert.equal(photoDisplayRejected('那是旧照片，没有。'), true);
+  assert.equal(photoDisplayRejected('那不是旧照片，是彩虹，我给你看。'), false);
+
+  const session = new ClientSession('photo-refusal-test');
+  const s = session as unknown as {
+    genimg: { generate: (...args: unknown[]) => void };
+    duplex: { returnToolResults: () => void; close: () => Promise<void> };
+    ws: { readyState: number; send: (raw: string) => void };
+    miraText: string;
+    stagedPhoto?: { contextId: string };
+    onToolCalls: (evt: Record<string, unknown>) => void;
+    onDuplexEvent: (evt: Record<string, unknown>) => void;
+    onGeneratedMedia: (evt: Record<string, unknown>) => void;
+  };
+  const generated: unknown[][] = [];
+  const sent: Record<string, unknown>[] = [];
+  s.genimg = { generate: (...args) => generated.push(args) };
+  s.duplex = { returnToolResults: () => {}, close: async () => {} };
+  s.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw) as Record<string, unknown>) };
+  s.onToolCalls({
+    response_id: 'tool-photo-1',
+    items: [
+      { name: 'show_photo', call_id: 'call-photo-1', arguments: JSON.stringify({ subject: '彩虹', caption: '彩虹' }) },
+    ],
+  });
+  assert.equal(generated.length, 1, 'photo generation starts before the final spoken reply');
+  const contextId = s.stagedPhoto!.contextId;
+  s.onGeneratedMedia({ id: 'photo-generating', kind: 'photo', status: 'generating', context_id: contextId });
+  assert.equal(
+    sent.some((m) => m.type === 'media.event'),
+    false,
+    'generating is kept off the client',
+  );
+  s.onDuplexEvent({ type: 'response.done', response_id: 'tool-photo-1' });
+  assert.equal(generated.length, 1, 'the tool response itself is not the final spoken confirmation');
+  s.miraText = '那是旧照片，没有。';
+  s.onDuplexEvent({ type: 'response.output_audio.done', response_id: 'reply-photo-1' });
+  s.onGeneratedMedia({
+    id: 'photo-ready',
+    kind: 'photo',
+    status: 'ready',
+    url: 'unrelated.jpg',
+    context_id: contextId,
+  });
+  assert.equal(
+    sent.some((m) => m.type === 'media.event'),
+    false,
+    'a refused photo never reaches the client',
+  );
+  await session.destroy();
+});
+
+test('an accepted staged photo releases a result that finished early', async () => {
+  const session = new ClientSession('photo-accept-test');
+  const s = session as unknown as {
+    genimg: { generate: (...args: unknown[]) => void };
+    duplex: { returnToolResults: () => void; close: () => Promise<void> };
+    ws: { readyState: number; send: (raw: string) => void };
+    miraText: string;
+    stagedPhoto?: { contextId: string };
+    onToolCalls: (evt: Record<string, unknown>) => void;
+    onDuplexEvent: (evt: Record<string, unknown>) => void;
+    onGeneratedMedia: (evt: Record<string, unknown>) => void;
+  };
+  const sent: Record<string, unknown>[] = [];
+  s.genimg = { generate: () => {} };
+  s.duplex = { returnToolResults: () => {}, close: async () => {} };
+  s.ws = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw) as Record<string, unknown>) };
+  s.onToolCalls({
+    response_id: 'tool-photo-2',
+    items: [{ name: 'show_photo', call_id: 'call-photo-2', arguments: JSON.stringify({ subject: '彩虹' }) }],
+  });
+  const contextId = s.stagedPhoto!.contextId;
+  s.onGeneratedMedia({
+    id: 'photo-ready-2',
+    kind: 'photo',
+    status: 'ready',
+    url: 'rainbow.jpg',
+    context_id: contextId,
+  });
+  assert.equal(
+    sent.some((m) => m.type === 'media.event'),
+    false,
+    'ready is held until the reply is confirmed',
+  );
+  s.miraText = '喏，这张就是彩虹。';
+  s.onDuplexEvent({ type: 'response.output_text.done', response_id: 'reply-photo-2', text: s.miraText });
+  s.onDuplexEvent({ type: 'response.output_audio.done', response_id: 'reply-photo-2' });
+  assert.equal(
+    sent.some((m) => m.type === 'media.event'),
+    true,
+    'accepted photo is released to the client',
+  );
+  await session.destroy();
 });
 
 test('the show_photo gesture alone arms a photo, and her spoken line refines its subject', () => {
@@ -810,7 +981,7 @@ test('loaded scene waits for speech and a newer scene cancels an older scheduled
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(useStore.getState().sceneTransition?.phase, 'departing');
     offer('second');
-    await new Promise((r) => setTimeout(r, SCENE_DEPART_MS + SCENE_ARRIVE_MS + 120));
+    await waitFor(() => useStore.getState().bgUrl === 'second.jpg' && useStore.getState().sceneTransition === null);
     assert.equal(useStore.getState().bgUrl, 'second.jpg');
     assert.equal(useStore.getState().sceneTransition, null);
     assert.deepEqual(sent, [{ type: 'scene.presented', id: 'second', ok: true }]);

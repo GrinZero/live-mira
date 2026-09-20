@@ -1,4 +1,4 @@
-import { isStagedScene, sceneFrame, layoutFromUrl } from '../../../shared/scene-layout';
+import { isStagedScene, companionFrame, layoutFromUrl } from '../../../shared/scene-layout';
 import { useRef } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
@@ -7,7 +7,7 @@ import { stagingFor } from './staging';
 
 // Match the actor to the fixed cafe matte. Keep the face in the left third;
 // reserve the right third for a shared object, never zoom the room like wallpaper.
-// 室外/转场按 staging 表拉远：全身进框，脚落在画面下缘。
+// Calibrated destinations use the same close-up crop as the photograph.
 export function CameraRig() {
   const { camera, size } = useThree();
   const settled = useRef(false);
@@ -17,12 +17,14 @@ export function CameraRig() {
     const portrait = size.width / size.height < 0.9;
     const state = useStore.getState();
     const photo = state.photo;
-    const st = stagingFor(state.bgKey);
+    const st = stagingFor(state.bgKey, state.bgUrl);
     // A static photograph cannot follow a dolly. Keep its calibrated framing;
     // switch to the destination framing only while the transition covers the cut.
     let distance = portrait ? st.distance.portrait : st.distance.landscape;
     let targetLookY = st.lookY;
-    const frame = isStagedScene(state.bgUrl) ? sceneFrame(size.width, size.height, layoutFromUrl(state.bgUrl)) : null;
+    const frame = isStagedScene(state.bgUrl)
+      ? companionFrame(size.width, size.height, layoutFromUrl(state.bgUrl))
+      : null;
     if (frame) {
       // Standing VRM is approximately 1.65m; feet include the standing root offset.
       const visibleWorldHeight = 1.65 / frame.actorHeight;
@@ -33,8 +35,9 @@ export function CameraRig() {
     const w = (h * size.width) / size.height;
     const actorX = frame?.actorX ?? (portrait ? (photo ? 0.27 : st.actorX.portrait) : st.actorX.landscape);
     const targetX = (0.5 - actorX) * w;
-    if (!settled.current || sceneKey.current !== state.bgKey) {
-      sceneKey.current = state.bgKey;
+    const identity = `${state.bgKey}:${state.bgUrl}:${size.width}:${size.height}`;
+    if (!settled.current || sceneKey.current !== identity) {
+      sceneKey.current = identity;
       settled.current = true;
       lookY.current = targetLookY;
       camera.position.set(targetX, targetLookY, distance);

@@ -1,0 +1,109 @@
+{
+  "$schema": "./cases.schema.json",
+  "schemaVersion": "1.0.0",
+  "datasetId": "mira-photo-semantics-regression-v1",
+  "datasetVersion": "1.0.0",
+  "provenance": {
+    "kind": "synthetic",
+    "statement": "Cases are synthetic regressions derived from the photo-display false positives and missed confirmation described in this repository.",
+    "containsPrivateSourceMaterial": false
+  },
+  "evaluation": {
+    "mode": "provider_required",
+    "confidenceThreshold": 0.65,
+    "minimumCasePassRate": 1,
+    "registeredScorers": ["photo-request-exact", "photo-response-exact"]
+  },
+  "cases": [
+    {
+      "id": "mira-photo-v1-001",
+      "category": "request",
+      "title": "Explicit request to view a photo",
+      "userText": "给我看看你旅途中拍的海边照片吧。",
+      "assistantText": "",
+      "expected": { "request": "request", "response": "none" },
+      "tags": ["request", "positive"]
+    },
+    {
+      "id": "mira-photo-v1-002",
+      "category": "request",
+      "title": "Photo praise is not a request",
+      "userText": "你这张照片拍得很好看。",
+      "assistantText": "",
+      "expected": { "request": "mention", "response": "none" },
+      "tags": ["request", "false-positive"]
+    },
+    {
+      "id": "mira-photo-v1-003",
+      "category": "request",
+      "title": "Photo mention with explicit non-request",
+      "userText": "我想起去年拍过一张照片，但不用拿给我看。",
+      "assistantText": "",
+      "expected": { "request": "mention", "response": "none" },
+      "tags": ["request", "negative"]
+    },
+    {
+      "id": "mira-photo-v1-004",
+      "category": "response",
+      "title": "Contextual confirmation from the reported bad case",
+      "userText": "你随身带的那张可以给我看一下吗？",
+      "assistantText": "哦，就是这张，折痕都快磨白了。",
+      "expected": { "request": "request", "response": "show" },
+      "tags": ["response", "reported-bad-case", "positive"]
+    },
+    {
+      "id": "mira-photo-v1-005",
+      "category": "response",
+      "title": "Explicit assistant-side presentation",
+      "userText": "你拍过桥边的雨吗？",
+      "assistantText": "我把手机递给你，里面就是那张桥边的雨景。",
+      "expected": { "request": "mention", "response": "show" },
+      "tags": ["response", "positive"]
+    },
+    {
+      "id": "mira-photo-v1-006",
+      "category": "response",
+      "title": "Explicit retraction",
+      "userText": "那张照片可以看看吗？",
+      "assistantText": "那是旧照片，没有了，今天先不给你看。",
+      "expected": { "request": "request", "response": "reject" },
+      "tags": ["response", "rejection", "negative"]
+    },
+    {
+      "id": "mira-photo-v1-007",
+      "category": "false-positive",
+      "title": "Polite particle is not a photo offer",
+      "userText": "外面雨是不是更大了？",
+      "assistantText": "喏，雨声又重了一点。",
+      "expected": { "request": "none", "response": "none" },
+      "tags": ["false-positive", "particle"]
+    },
+    {
+      "id": "mira-photo-v1-008",
+      "category": "false-positive",
+      "title": "Showing another prop is not showing a photo",
+      "userText": "你手里的杯子是什么？",
+      "assistantText": "给你看，这杯咖啡刚冲好。",
+      "expected": { "request": "none", "response": "none" },
+      "tags": ["false-positive", "prop"]
+    },
+    {
+      "id": "mira-photo-v1-009",
+      "category": "false-positive",
+      "title": "这张 must resolve to its object",
+      "userText": "这张桌子是不是很旧？",
+      "assistantText": "这张桌子确实有些磨损。",
+      "expected": { "request": "none", "response": "none" },
+      "tags": ["false-positive", "demonstrative"]
+    },
+    {
+      "id": "mira-photo-v1-010",
+      "category": "mention",
+      "title": "Photography discussion is not a display",
+      "userText": "你平时喜欢摄影吗？",
+      "assistantText": "以前我只是偶尔拍照，给照片起名字也很慢。",
+      "expected": { "request": "mention", "response": "mention" },
+      "tags": ["mention", "negative"]
+    }
+  ]
+}

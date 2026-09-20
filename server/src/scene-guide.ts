@@ -1,10 +1,16 @@
+import { sceneSpace } from '../../shared/scene-space.js';
 import type { ForegroundPlan } from '../../shared/foreground-layout.js';
 import sharp from 'sharp';
 import { SCENE_LAYOUT, type SceneLayout } from '../../shared/scene-layout.js';
 
 // This is a machine-readable composition reference, not a generated background.
 // The rectangle and the renderer both use the same source-space layout.
-export async function sceneGuide(s: SceneLayout = SCENE_LAYOUT, foreground?: ForegroundPlan | null): Promise<Buffer> {
+export async function sceneGuide(
+  s: SceneLayout = SCENE_LAYOUT,
+  foreground?: ForegroundPlan | null,
+  theme = '',
+): Promise<Buffer> {
+  const space = sceneSpace(theme, s);
   const x = s.width * s.x;
   const foot = s.height * s.footY;
   const head = foot - s.height * s.actorHeight;
@@ -26,6 +32,13 @@ export async function sceneGuide(s: SceneLayout = SCENE_LAYOUT, foreground?: For
     }
     <g stroke="#818995" stroke-width="3" fill="none">${rays}${rows}</g>
     <path d="M 0 ${horizon} H ${s.width}" stroke="#bcc4cf" stroke-width="4"/>
+    ${
+      space
+        ? `<rect x="${space.left * s.width}" y="0" width="${(space.right - space.left) * s.width}" height="${space.roofY * s.height}" fill="#ce883a" stroke="#ffbb55" stroke-width="6"/>
+    <rect x="${space.left * s.width}" y="${space.floorBack * s.height}" width="${(space.right - space.left) * s.width}" height="${(space.floorFront - space.floorBack) * s.height}" fill="#53816b" stroke="#88ddaa" stroke-width="6"/>
+    <path d="M ${space.left * s.width} ${space.roofY * s.height} V ${space.floorFront * s.height} M ${space.right * s.width} ${space.roofY * s.height} V ${space.floorFront * s.height}" stroke="#ce883a" stroke-width="18"/>`
+        : ''
+    }
     <rect x="${x - halfWidth}" y="${head}" width="${halfWidth * 2}" height="${foot - head}"
       fill="#ff00aa" fill-opacity="0.18" stroke="#ff00aa" stroke-width="10"/>
   </svg>`),

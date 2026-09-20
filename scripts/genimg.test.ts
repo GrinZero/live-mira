@@ -146,7 +146,7 @@ test('scene requests send a visual guide and never retry as text-only generation
   }
 });
 
-test('random scene boxes vary, remain bounded and keep 60% viewport height', () => {
+test('random scene boxes vary and retain source-image scale across viewport crops', () => {
   const layouts = [0, 0.1, 0.5, 0.9, 1].map((n) => randomSceneLayout(() => n));
   assert.equal(new Set(layouts.map(layoutToken)).size, 5);
   for (const layout of layouts) {
@@ -162,8 +162,8 @@ test('random scene boxes vary, remain bounded and keep 60% viewport height', () 
       [844, 390],
     ]) {
       const f = sceneFrame(w, h, layout);
-      assert.equal(f.actorHeight, 0.6);
-      assert.ok(f.footY - f.actorHeight >= 0.1 && f.footY <= 0.9);
+      assert.equal(f.actorHeight, (f.height * layout.actorHeight) / h);
+      assert.ok(f.footY <= 0.9);
       const halfWidth = (h * f.actorHeight * 0.22) / w;
       assert.ok(f.actorX - halfWidth >= 0.03 && f.actorX + halfWidth <= 0.97);
       assert.ok(Math.abs(f.actorX * w - (f.left + f.width * layout.x)) < 1e-8);
@@ -186,6 +186,25 @@ test('new scenes receive different guide positions and revisits reuse the same i
   const guides: string[] = [];
   let calls = 0;
   globalThis.fetch = (async (url, init) => {
+    if (String(url).endsWith('/chat/completions')) {
+      return Response.json({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                ground: true,
+                clearance: true,
+                scale: true,
+                destination: true,
+                clean: true,
+                confidence: 0.99,
+                reason: 'fixture geometry accepted',
+              }),
+            },
+          },
+        ],
+      });
+    }
     if (String(url).endsWith('/images/generations')) {
       calls++;
       const request = JSON.parse(String(init?.body));
@@ -235,6 +254,72 @@ test('foreground is opt-in for near framing objects, not automatic for scenery',
   assert.equal(planForeground('门廊，不需要前景', SCENE_LAYOUT), null);
   assert.equal(planForeground('在木门廊下看雨', SCENE_LAYOUT)?.side, 'right');
   assert.equal(planForeground('在木门廊下看雨', { ...SCENE_LAYOUT, x: 0.7 })?.side, 'left');
+});
+
+test('scene generation skips AI placement review and reuses the completed image', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mira-geometry-'));
+  const oldDir = config.cacheDir,
+    oldFetch = globalThis.fetch;
+  config.cacheDir = dir;
+  const bytes = fs.readFileSync(path.join(config.assetsDir, 'bg/cafe_interior.jpg'));
+  let checks = 0;
+  globalThis.fetch = (async (url, init) => {
+    if (String(url).endsWith('/images/generations'))
+      return Response.json({ data: [{ url: 'https://image.test/bad-ground' }] });
+    if (String(url).endsWith('/chat/completions')) {
+      checks++;
+      const body = JSON.parse(String(init?.body));
+      assert.equal(body.messages[1].content.filter((part: { type: string }) => part.type === 'image_url').length, 2);
+      return Response.json({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                ground: false,
+                clearance: false,
+                scale: true,
+                destination: true,
+                clean: true,
+                confidence: 0.99,
+                reason: 'wooden table at foot position',
+              }),
+            },
+          },
+        ],
+      });
+    }
+    return new Response(new Uint8Array(bytes));
+  }) as typeof fetch;
+  try {
+    const events: MediaEvent[] = [];
+    for (let repeat = 0; repeat < 2; repeat++) {
+      await new Promise<void>((resolve) => {
+        createGenImg({
+          ...content,
+          layoutRandom: () => 0.5,
+          onDegrade: () => {},
+          sendMedia: (e) => {
+            events.push(e);
+            if (e.status === 'failed' || e.status === 'ready') resolve();
+          },
+        }).generate('scene', '咖啡馆窗边');
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.equal(checks, 0);
+    assert.equal(events.filter((e) => e.status === 'ready').length, 2);
+    assert.equal(events.filter((e) => e.status === 'failed').length, 0);
+    assert.ok(events.some((e) => e.status === 'ready' && e.cached));
+    assert.ok(!fs.readdirSync(path.join(dir, 'media')).some((file) => file.includes('.rejected-')));
+    assert.equal(
+      fs.readdirSync(path.join(dir, 'media')).filter((file) => /_stage3_\d{3}_\d{3}\.jpg$/.test(file)).length,
+      1,
+    );
+  } finally {
+    config.cacheDir = oldDir;
+    globalThis.fetch = oldFetch;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('foreground split keeps source RGB, alpha holes, actor protection and immutable background pixels', async () => {
